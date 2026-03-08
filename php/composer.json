@@ -1,0 +1,13 @@
+{
+  "name": "fium/framework",
+  "description": "PHP-side package scaffold for the Fium runtime experiment",
+  "type": "library",
+  "require": {
+    "php": "^8.2"
+  },
+  "autoload": {
+    "psr-4": {
+      "Fium\\": "src/"
+    }
+  }
+}
