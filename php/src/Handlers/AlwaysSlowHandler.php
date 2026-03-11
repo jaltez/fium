@@ -8,17 +8,15 @@ use Fium\Contracts\Handler;
 use Fium\Runtime\Request;
 use Fium\Runtime\Response;
 
-final class ApiMeHandler implements Handler
+final class AlwaysSlowHandler implements Handler
 {
     public function __invoke(Request $request): Response
     {
-        $user = $request->user();
+        usleep(1500000);
 
         return Response::json([
             'ok' => true,
-            'user' => $user?->toArray(),
-            'route' => $request->matchedRoute(),
-            'method' => $request->method(),
+            'route' => (string) $request->matchedRoute(),
         ]);
     }
 }

@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace Fium\Runtime;
 
 use Fium\Auth\Authenticator;
+use Fium\Auth\ApiTokenService;
 use Fium\Auth\User;
 use Fium\Session\Session;
+use Fium\Validator;
 
 final class Request
 {
@@ -41,6 +43,19 @@ final class Request
         return isset($this->payload['matched_route']) ? (string) $this->payload['matched_route'] : null;
     }
 
+    public function routeParam(string $name, ?string $default = null): ?string
+    {
+        $routeParams = $this->payload['route_params'] ?? null;
+
+        if (!is_array($routeParams)) {
+            return $default;
+        }
+
+        $value = $routeParams[$name] ?? $default;
+
+        return is_string($value) ? $value : $default;
+    }
+
     public function header(string $name): ?string
     {
         $headers = $this->payload['headers'] ?? null;
@@ -57,6 +72,19 @@ final class Request
         }
 
         return (string) $values[0];
+    }
+
+    public function bearerToken(): ?string
+    {
+        $authorization = $this->header('authorization');
+
+        if (!is_string($authorization) || !str_starts_with($authorization, 'Bearer ')) {
+            return null;
+        }
+
+        $token = substr($authorization, 7);
+
+        return $token !== '' ? $token : null;
     }
 
     public function cookie(string $name): ?string
@@ -149,6 +177,23 @@ final class Request
         $authenticator = $this->attribute('authenticator');
 
         return $authenticator instanceof Authenticator ? $authenticator : null;
+    }
+
+    public function tokenService(): ?ApiTokenService
+    {
+        $tokenService = $this->attribute('token_service');
+
+        return $tokenService instanceof ApiTokenService ? $tokenService : null;
+    }
+
+    /**
+     * Validate request input against rules.
+     *
+     * @param array<string, string> $rules e.g. ['email' => 'required|email', 'name' => 'required|min:2']
+     */
+    public function validate(array $rules): Validator
+    {
+        return Validator::make($this, $rules);
     }
 
     /** @return array<string, mixed> */

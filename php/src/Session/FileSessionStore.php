@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Fium\Session;
 
-final class FileSessionStore
+final class FileSessionStore implements SessionStore
 {
     public function __construct(private string $directory)
     {

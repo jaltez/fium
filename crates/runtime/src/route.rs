@@ -1,12 +1,11 @@
-use serde::Deserialize;
-use std::{fs, path::Path};
+use fium_transport::BootRoute;
+use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RouteEntry {
     pub method: String,
     pub path: String,
     pub name: String,
-    pub handler: String,
 }
 
 #[derive(Debug, Clone)]
@@ -14,50 +13,82 @@ pub struct RouteTable {
     routes: Vec<RouteEntry>,
 }
 
-impl RouteTable {
-    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, String> {
-        let path = path.as_ref();
-        let raw = fs::read_to_string(path)
-            .map_err(|error| format!("failed to read route manifest '{}': {error}", path.display()))?;
-        let routes: Vec<RouteEntry> = serde_json::from_str(&raw)
-            .map_err(|error| format!("failed to parse route manifest '{}': {error}", path.display()))?;
+#[derive(Debug, Clone)]
+pub struct RouteMatch {
+    pub route: RouteEntry,
+    pub params: BTreeMap<String, String>,
+}
 
-        if routes.is_empty() {
-            return Err(format!("route manifest '{}' contained no routes", path.display()));
+impl RouteTable {
+    pub fn from_boot_routes(boot_routes: Vec<BootRoute>) -> Result<Self, String> {
+        if boot_routes.is_empty() {
+            return Err("worker boot message contained no routes".to_string());
         }
+
+        let routes = boot_routes
+            .into_iter()
+            .map(|br| RouteEntry {
+                method: br.method,
+                path: br.path,
+                name: br.name,
+            })
+            .collect();
 
         Ok(Self { routes })
     }
 
-    pub fn phase_one() -> Self {
-        Self {
-            routes: vec![
-                RouteEntry {
-                    method: "GET".to_string(),
-                    path: "/".to_string(),
-                    name: "home".to_string(),
-                    handler: "Fium\\Handlers\\HomeHandler".to_string(),
-                },
-                RouteEntry {
-                    method: "GET".to_string(),
-                    path: "/api/me".to_string(),
-                    name: "api.me".to_string(),
-                    handler: "Fium\\Handlers\\ApiMeHandler".to_string(),
-                },
-            ],
+    pub fn match_route(&self, method: &str, path: &str) -> Option<RouteMatch> {
+        self.routes.iter().find_map(|route| {
+            if route.method != method {
+                return None;
+            }
+
+            match_path(&route.path, path).map(|params| RouteMatch {
+                route: route.clone(),
+                params,
+            })
+        })
+    }
+}
+
+fn match_path(pattern: &str, actual: &str) -> Option<BTreeMap<String, String>> {
+    let pattern_segments = split_segments(pattern);
+    let actual_segments = split_segments(actual);
+
+    if pattern_segments.len() != actual_segments.len() {
+        return None;
+    }
+
+    let mut params = BTreeMap::new();
+
+    for (pattern_segment, actual_segment) in pattern_segments.iter().zip(actual_segments.iter()) {
+        if let Some(param_name) = extract_param_name(pattern_segment) {
+            params.insert(param_name.to_string(), (*actual_segment).to_string());
+            continue;
+        }
+
+        if pattern_segment != actual_segment {
+            return None;
         }
     }
 
-    pub fn load_or_phase_one(path: impl AsRef<Path>) -> Self {
-        match Self::load_from_file(path) {
-            Ok(routes) => routes,
-            Err(_) => Self::phase_one(),
-        }
+    Some(params)
+}
+
+fn split_segments(path: &str) -> Vec<&str> {
+    if path == "/" {
+        return Vec::new();
     }
 
-    pub fn match_route(&self, method: &str, path: &str) -> Option<&RouteEntry> {
-        self.routes
-            .iter()
-            .find(|route| route.method == method && route.path == path)
-    }
+    path.trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn extract_param_name(segment: &str) -> Option<&str> {
+    segment
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .filter(|value| !value.is_empty())
 }

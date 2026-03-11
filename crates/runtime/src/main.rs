@@ -1,6 +1,8 @@
+mod embed;
 mod route;
 mod worker;
 
+use anyhow::anyhow;
 use axum::{
     body::{to_bytes, Body},
     extract::{Request, State},
@@ -9,19 +11,47 @@ use axum::{
     routing::get,
     Router,
 };
+use clap::Parser;
 use fium_transport::{CookieMap, HeaderMap, SetCookie, WorkerRequest, PROTOCOL_VERSION};
 use route::RouteTable;
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tracing::{error, info};
 use uuid::Uuid;
-use worker::WorkerSupervisor;
+use worker::WorkerPool;
 
-const ROUTE_MANIFEST_PATH: &str = "php/routes.json";
+#[derive(Parser)]
+#[command(name = "fium", about = "Deno for PHP — a fast runtime for PHP applications")]
+enum Cli {
+    /// Start the HTTP server
+    Serve {
+        /// Path to the PHP application file
+        #[arg(default_value = "app.php")]
+        app: PathBuf,
+
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port to bind to
+        #[arg(short, long, default_value_t = 3000)]
+        port: u16,
+
+        /// Number of PHP worker processes
+        #[arg(short, long, default_value_t = num_workers_default())]
+        workers: usize,
+    },
+}
+
+fn num_workers_default() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
 
 #[derive(Clone)]
 struct AppState {
     routes: Arc<RouteTable>,
-    workers: WorkerSupervisor,
+    pool: WorkerPool,
 }
 
 #[tokio::main]
@@ -30,9 +60,48 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    let cli = Cli::parse();
+
+    match cli {
+        Cli::Serve { app, host, port, workers: worker_count } => {
+            serve(app, host, port, worker_count).await
+        }
+    }
+}
+
+async fn serve(app: PathBuf, host: String, port: u16, worker_count: usize) -> anyhow::Result<()> {
+    // Resolve app path
+    let app_path = if app.is_absolute() {
+        app
+    } else {
+        std::env::current_dir()?.join(app)
+    };
+
+    if !app_path.is_file() {
+        anyhow::bail!("application file not found: {}", app_path.display());
+    }
+
+    // Extract embedded PHP library
+    let lib_dir = embed::extract_php_lib(&app_path)?;
+    info!(lib_dir = %lib_dir.display(), "extracted PHP library");
+
+    // Build the worker entrypoint path
+    let worker_entrypoint = lib_dir.join("worker.php");
+
+    // Boot the worker pool
+    info!(workers = worker_count, "booting PHP worker pool...");
+    let pool = WorkerPool::new(
+        worker_entrypoint.to_string_lossy().to_string(),
+        app_path.to_string_lossy().to_string(),
+        worker_count,
+    );
+
+    let routes = pool.boot().await
+        .map_err(|error| anyhow!(error))?;
+
     let state = AppState {
-        routes: Arc::new(RouteTable::load_or_phase_one(ROUTE_MANIFEST_PATH)),
-        workers: WorkerSupervisor::new("php/worker.php"),
+        routes: Arc::new(routes),
+        pool,
     };
 
     let app = Router::new()
@@ -40,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
         .fallback(dispatch)
         .with_state(state);
 
-    let address: SocketAddr = "127.0.0.1:3000".parse()?;
+    let address: SocketAddr = format!("{host}:{port}").parse()?;
     info!(%address, "starting runtime");
 
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -59,9 +128,10 @@ async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Resp
     let path = request.uri().path().to_string();
     let method = request.method().to_string();
 
-    let Some(route) = state.routes.match_route(&method, &path) else {
+    let Some(route_match) = state.routes.match_route(&method, &path) else {
         return (StatusCode::NOT_FOUND, "route not found").into_response();
     };
+    let route = route_match.route;
 
     let request_id = format!("req_{}", Uuid::new_v4().simple());
     let query_string = request.uri().query().unwrap_or_default().to_string();
@@ -95,7 +165,7 @@ async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Resp
         query_string,
         headers,
         cookies,
-        route_params: BTreeMap::new(),
+        route_params: route_match.params,
         body,
         scheme,
         host,
@@ -104,12 +174,10 @@ async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Resp
         matched_route: Some(route.name.clone()),
     };
 
-    match state.workers.handle(worker_request).await {
+    match state.pool.handle(worker_request).await {
         Ok(worker_response) => {
-            let mut response = worker_response
-                .body
-                .unwrap_or_else(|| "".to_string())
-                .into_response();
+            let body = worker_response.body.unwrap_or_default();
+            let mut response = Response::new(Body::from(body));
 
             *response.status_mut() = StatusCode::from_u16(worker_response.status)
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -137,7 +205,13 @@ async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Resp
         }
         Err(error_message) => {
             error!(%error_message, route = %route.name, "worker dispatch failed");
-            (StatusCode::BAD_GATEWAY, "worker dispatch failed").into_response()
+            let status = if error_message.starts_with("worker request timed out") {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+
+            (status, "worker dispatch failed").into_response()
         }
     }
 }

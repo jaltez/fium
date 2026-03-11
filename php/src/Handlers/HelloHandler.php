@@ -8,17 +8,19 @@ use Fium\Contracts\Handler;
 use Fium\Runtime\Request;
 use Fium\Runtime\Response;
 
-final class ApiMeHandler implements Handler
+final class HelloHandler implements Handler
 {
     public function __invoke(Request $request): Response
     {
-        $user = $request->user();
+        $name = $request->routeParam('name', 'world');
 
         return Response::json([
             'ok' => true,
-            'user' => $user?->toArray(),
             'route' => $request->matchedRoute(),
-            'method' => $request->method(),
+            'greeting' => sprintf('Hello, %s!', $name),
+            'params' => [
+                'name' => $name,
+            ],
         ]);
     }
 }

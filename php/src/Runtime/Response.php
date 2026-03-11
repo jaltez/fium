@@ -34,6 +34,36 @@ final class Response
         return new self($status, ['content-type' => ['application/json']], $json);
     }
 
+    /** @param array<string, list<string>> $errors */
+    public static function validationError(array $errors): self
+    {
+        return self::json([
+            'ok' => false,
+            'error' => 'validation_failed',
+            'errors' => $errors,
+        ], 422);
+    }
+
+    public static function html(string $html, int $status = 200): self
+    {
+        return new self($status, ['content-type' => ['text/html; charset=UTF-8']], $html);
+    }
+
+    public static function text(string $text, int $status = 200): self
+    {
+        return new self($status, ['content-type' => ['text/plain; charset=UTF-8']], $text);
+    }
+
+    public static function redirect(string $url, int $status = 302): self
+    {
+        return new self($status, ['location' => [$url]], null);
+    }
+
+    public static function empty(int $status = 204): self
+    {
+        return new self($status, [], null);
+    }
+
     public static function fromThrowable(\Throwable $throwable, ?string $requestId = null, bool $debug = false): self
     {
         $payload = [

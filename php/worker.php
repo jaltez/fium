@@ -19,7 +19,8 @@ spl_autoload_register(static function (string $class): void {
 
 use Fium\Application;
 
-$application = Application::boot(__DIR__ . '/routes.php');
+$routesPath = $argv[1] ?? __DIR__ . '/routes.php';
+$application = Application::boot($routesPath);
 
 $stdin = fopen('php://stdin', 'r');
 $stdout = fopen('php://stdout', 'w');
@@ -28,6 +29,10 @@ if ($stdin === false || $stdout === false) {
     fwrite(STDERR, "Unable to open worker streams\n");
     exit(1);
 }
+
+// Boot protocol: send route manifest as first message
+fwrite($stdout, $application->bootManifest() . PHP_EOL);
+fflush($stdout);
 
 while (($line = fgets($stdin)) !== false) {
     $request = json_decode(trim($line), true);
