@@ -5,7 +5,7 @@ mod worker;
 use anyhow::anyhow;
 use axum::{
     body::{to_bytes, Body},
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -113,7 +113,10 @@ async fn serve(app: PathBuf, host: String, port: u16, worker_count: usize) -> an
     info!(%address, "starting runtime");
 
     let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, app)
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
@@ -124,7 +127,11 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Response {
+async fn dispatch(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response {
     let path = request.uri().path().to_string();
     let method = request.method().to_string();
 
@@ -141,7 +148,13 @@ async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Resp
         .and_then(|value| value.to_str().ok())
         .unwrap_or("localhost")
         .to_string();
-    let scheme = request.uri().scheme_str().unwrap_or("http").to_string();
+    let scheme = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_else(|| request.uri().scheme_str().unwrap_or("http"))
+        .to_string();
+    let is_secure = scheme == "https";
     let headers = normalize_headers(request.headers());
     let cookies = parse_cookies(request.headers());
     let body_bytes = match to_bytes(request.into_body(), 1024 * 1024).await {
@@ -169,8 +182,8 @@ async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Resp
         body,
         scheme,
         host,
-        client_ip: None,
-        is_secure: false,
+        client_ip: Some(addr.ip().to_string()),
+        is_secure,
         matched_route: Some(route.name.clone()),
     };
 
@@ -258,7 +271,8 @@ fn parse_cookies(headers: &axum::http::HeaderMap) -> CookieMap {
 }
 
 fn format_set_cookie(cookie: &SetCookie) -> String {
-    let mut header = format!("{}={}", cookie.name, cookie.value);
+    let encoded_value = encode_cookie_value(&cookie.value);
+    let mut header = format!("{}={}", cookie.name, encoded_value);
 
     if let Some(path) = &cookie.path {
         header.push_str(&format!("; Path={path}"));
@@ -269,6 +283,29 @@ fn format_set_cookie(cookie: &SetCookie) -> String {
     if cookie.secure {
         header.push_str("; Secure");
     }
+    if let Some(same_site) = &cookie.same_site {
+        header.push_str(&format!("; SameSite={same_site}"));
+    }
+    if let Some(max_age) = cookie.max_age {
+        header.push_str(&format!("; Max-Age={max_age}"));
+    }
 
     header
+}
+
+/// Percent-encode characters that are not allowed unquoted in a Set-Cookie value per RFC 6265.
+fn encode_cookie_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            // RFC 6265 §4.1.1 cookie-octet: allowed unescaped
+            0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    encoded
 }

@@ -49,6 +49,10 @@ pub struct SetCookie {
     pub path: Option<String>,
     pub http_only: bool,
     pub secure: bool,
+    #[serde(default)]
+    pub same_site: Option<String>,
+    #[serde(default)]
+    pub max_age: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
