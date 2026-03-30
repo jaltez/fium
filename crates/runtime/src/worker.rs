@@ -7,8 +7,8 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-use std::{env, path::PathBuf, sync::Arc};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{path::PathBuf, sync::Arc};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::route::RouteTable;
 
@@ -19,7 +19,11 @@ pub struct WorkerSupervisor {
     app_file: PathBuf,
     request_timeout: Duration,
     boot_timeout: Duration,
+    max_requests: u64,
     process: Arc<Mutex<Option<WorkerProcess>>>,
+    requests_handled: Arc<AtomicU64>,
+    restarts: Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -30,15 +34,37 @@ struct WorkerProcess {
 }
 
 impl WorkerSupervisor {
-    pub fn new(worker_entrypoint: impl Into<String>, app_file: impl Into<String>) -> Self {
+    pub fn new(
+        worker_entrypoint: impl Into<String>,
+        app_file: impl Into<String>,
+        request_timeout_ms: u64,
+        max_requests: u64,
+    ) -> Self {
+        let timeout_ms = if request_timeout_ms > 0 { request_timeout_ms } else { 750 };
         Self {
             php_binary: "php".to_string(),
             worker_entrypoint: PathBuf::from(worker_entrypoint.into()),
             app_file: PathBuf::from(app_file.into()),
-            request_timeout: resolve_request_timeout(),
+            request_timeout: Duration::from_millis(timeout_ms),
             boot_timeout: Duration::from_secs(10),
+            max_requests,
             process: Arc::new(Mutex::new(None)),
+            requests_handled: Arc::new(AtomicU64::new(0)),
+            restarts: Arc::new(AtomicU64::new(0)),
+            errors: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn requests_handled(&self) -> u64 {
+        self.requests_handled.load(Ordering::Relaxed)
+    }
+
+    pub fn restarts(&self) -> u64 {
+        self.restarts.load(Ordering::Relaxed)
+    }
+
+    pub fn errors(&self) -> u64 {
+        self.errors.load(Ordering::Relaxed)
     }
 
     /// Spawn the PHP worker and read the boot message containing the route manifest.
@@ -91,19 +117,41 @@ impl WorkerSupervisor {
     pub async fn handle(&self, request: WorkerRequest) -> Result<WorkerResponse, String> {
         let mut process = self.process.lock().await;
 
+        // Check if worker needs recycling due to max_requests
+        if self.max_requests > 0 {
+            let handled = self.requests_handled.load(Ordering::Relaxed);
+            if handled > 0 && handled % self.max_requests == 0 {
+                info!(handled, max_requests = self.max_requests, "recycling worker after max_requests");
+                self.restart_locked(&mut process).await?;
+                self.restarts.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         match self.dispatch_once_locked(&mut process, &request).await {
-            Ok(response) => Ok(response),
+            Ok(response) => {
+                self.requests_handled.fetch_add(1, Ordering::Relaxed);
+                Ok(response)
+            }
             Err(first_error) => {
+                self.errors.fetch_add(1, Ordering::Relaxed);
                 warn!(%first_error, "worker request failed, attempting restart");
                 self.restart_locked(&mut process).await?;
+                self.restarts.fetch_add(1, Ordering::Relaxed);
 
                 match self.dispatch_once_locked(&mut process, &request).await {
-                    Ok(response) => Ok(response),
+                    Ok(response) => {
+                        self.requests_handled.fetch_add(1, Ordering::Relaxed);
+                        Ok(response)
+                    }
                     Err(second_error) => {
+                        self.errors.fetch_add(1, Ordering::Relaxed);
                         warn!(%second_error, "worker request failed after restart, replacing worker before returning error");
 
                         match self.restart_locked(&mut process).await {
-                            Ok(()) => Err(second_error),
+                            Ok(()) => {
+                                self.restarts.fetch_add(1, Ordering::Relaxed);
+                                Err(second_error)
+                            }
                             Err(restart_error) => Err(format!(
                                 "{second_error}; additionally failed to replace worker after retry failure: {restart_error}"
                             )),
@@ -273,22 +321,6 @@ impl WorkerSupervisor {
         })
     }
 }
-
-fn resolve_request_timeout() -> Duration {
-    const DEFAULT_TIMEOUT_MS: u64 = 750;
-
-    match env::var("FIUM_WORKER_TIMEOUT_MS") {
-        Ok(value) => match value.parse::<u64>() {
-            Ok(milliseconds) if milliseconds > 0 => Duration::from_millis(milliseconds),
-            Ok(_) | Err(_) => {
-                warn!(value = %value, fallback_ms = DEFAULT_TIMEOUT_MS, "invalid FIUM_WORKER_TIMEOUT_MS, using default");
-                Duration::from_millis(DEFAULT_TIMEOUT_MS)
-            }
-        },
-        Err(_) => Duration::from_millis(DEFAULT_TIMEOUT_MS),
-    }
-}
-
 /// A pool of PHP worker processes that distributes requests round-robin.
 #[derive(Clone)]
 pub struct WorkerPool {
@@ -301,19 +333,31 @@ impl WorkerPool {
         worker_entrypoint: impl Into<String>,
         app_file: impl Into<String>,
         count: usize,
+        max_requests: u64,
+        worker_timeout_ms: u64,
     ) -> Self {
         let entrypoint = worker_entrypoint.into();
         let app = app_file.into();
         let count = count.max(1);
 
         let workers: Vec<WorkerSupervisor> = (0..count)
-            .map(|_| WorkerSupervisor::new(entrypoint.clone(), app.clone()))
+            .map(|_| WorkerSupervisor::new(entrypoint.clone(), app.clone(), worker_timeout_ms, max_requests))
             .collect();
 
         Self {
             workers: Arc::new(workers),
             next: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn workers(&self) -> &[WorkerSupervisor] {
+        &self.workers
+    }
+
+    /// Restart all workers and rebuild the route table from a fresh boot message.
+    pub async fn reload(&self) -> Result<RouteTable, String> {
+        self.restart_all().await;
+        self.boot().await
     }
 
     /// Boot the first worker and get the route table, then boot the remaining workers.
@@ -338,6 +382,24 @@ impl WorkerPool {
         info!(workers = self.workers.len(), "all workers booted");
 
         Ok(routes)
+    }
+
+    /// Restart all workers (used by dev mode file watcher).
+    pub async fn restart_all(&self) {
+        let mut handles = Vec::new();
+        for worker in self.workers.iter() {
+            let worker = worker.clone();
+            handles.push(tokio::spawn(async move {
+                let mut process = worker.process.lock().await;
+                if let Err(e) = worker.restart_locked(&mut process).await {
+                    warn!(%e, "failed to restart worker during reload");
+                }
+                // ensure_started will re-spawn on next request
+            }));
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
 
     /// Dispatch a request to the next available worker (round-robin).

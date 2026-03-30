@@ -51,15 +51,12 @@ final class PdoSessionStore implements SessionStore
 
         $stmt = $this->pdo->prepare(
             'INSERT INTO sessions (id, data, updated_at) VALUES (:id, :data, :now) '
-            . 'ON CONFLICT(id) DO UPDATE SET data = :data2, updated_at = :now2'
+            . 'ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at'
         );
-        $now = date('Y-m-d H:i:s');
         $stmt->execute([
             'id' => $session->id(),
             'data' => $json,
-            'now' => $now,
-            'data2' => $json,
-            'now2' => $now,
+            'now' => date('Y-m-d H:i:s'),
         ]);
     }
 

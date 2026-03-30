@@ -104,6 +104,8 @@ final class Response
         ?string $path = '/',
         bool $httpOnly = true,
         bool $secure = false,
+        ?string $sameSite = 'Lax',
+        ?int $maxAge = null,
     ): self {
         $clone = clone $this;
         $clone->cookies[] = [
@@ -112,6 +114,8 @@ final class Response
             'path' => $path,
             'http_only' => $httpOnly,
             'secure' => $secure,
+            'same_site' => $sameSite,
+            'max_age' => $maxAge,
         ];
 
         return $clone;

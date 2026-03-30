@@ -45,7 +45,7 @@ final class FileSessionStore implements SessionStore
             throw new \RuntimeException('Failed to encode session data.');
         }
 
-        file_put_contents($this->pathFor($session->id()), $json . PHP_EOL);
+        file_put_contents($this->pathFor($session->id()), $json . PHP_EOL, LOCK_EX);
     }
 
     private function pathFor(string $sessionId): string

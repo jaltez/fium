@@ -12,6 +12,10 @@ use Fium\Validator;
 
 final class Request
 {
+    private ?array $parsedQuery = null;
+    private ?array $parsedJson = null;
+    private bool $jsonParsed = false;
+
     /** @param array<string, mixed> $payload */
     private function __construct(private array $payload)
     {
@@ -36,6 +40,44 @@ final class Request
     public function method(): string
     {
         return (string) ($this->payload['method'] ?? 'GET');
+    }
+
+    public function queryString(): string
+    {
+        return (string) ($this->payload['query_string'] ?? '');
+    }
+
+    public function query(string $key, ?string $default = null): ?string
+    {
+        if ($this->parsedQuery === null) {
+            parse_str($this->queryString(), $this->parsedQuery);
+        }
+
+        if (!array_key_exists($key, $this->parsedQuery)) {
+            return $default;
+        }
+
+        return is_string($this->parsedQuery[$key]) ? $this->parsedQuery[$key] : $default;
+    }
+
+    public function clientIp(): ?string
+    {
+        return isset($this->payload['client_ip']) ? (string) $this->payload['client_ip'] : null;
+    }
+
+    public function scheme(): string
+    {
+        return (string) ($this->payload['scheme'] ?? 'http');
+    }
+
+    public function isSecure(): bool
+    {
+        return (bool) ($this->payload['is_secure'] ?? false);
+    }
+
+    public function host(): string
+    {
+        return (string) ($this->payload['host'] ?? 'localhost');
     }
 
     public function matchedRoute(): ?string
@@ -103,6 +145,11 @@ final class Request
     /** @return array<string, mixed>|null */
     public function json(): ?array
     {
+        if ($this->jsonParsed) {
+            return $this->parsedJson;
+        }
+
+        $this->jsonParsed = true;
         $body = $this->payload['body'] ?? null;
 
         if (!is_string($body) || $body === '') {
@@ -110,8 +157,9 @@ final class Request
         }
 
         $decoded = json_decode($body, true);
+        $this->parsedJson = is_array($decoded) ? $decoded : null;
 
-        return is_array($decoded) ? $decoded : null;
+        return $this->parsedJson;
     }
 
     public function input(string $key, mixed $default = null): mixed

@@ -37,6 +37,11 @@ impl RouteTable {
         Ok(Self { routes })
     }
 
+    /// Return a list of (method, path, name) for the boot banner.
+    pub fn list(&self) -> Vec<(&str, &str, &str)> {
+        self.routes.iter().map(|r| (r.method.as_str(), r.path.as_str(), r.name.as_str())).collect()
+    }
+
     pub fn match_route(&self, method: &str, path: &str) -> Option<RouteMatch> {
         self.routes.iter().find_map(|route| {
             if route.method != method {

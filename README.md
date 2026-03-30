@@ -1,89 +1,147 @@
 # Fium
 
-Fium is an early-stage experiment toward a standalone Rust runtime for lightweight PHP applications.
+A fast PHP runtime powered by Rust. Write a single `app.php`, run `fium serve`, done.
 
-Current scope:
+## What it does
 
-- define the Rust-to-PHP transport contract
-- scaffold the minimal runtime spike
-- keep the PHP-facing framework surface explicit and small
+- **Rust binary** owns HTTP serving, route matching, TLS, static files, compression, worker supervision, and metrics
+- **PHP** owns business logic — handlers, middleware, sessions, auth, caching
+- **Zero-dependency** PHP framework embedded in the binary
+- **Zero-config** by default — power users can add an optional `fium.toml`
 
-This repository is intentionally at planning and spike stage, not feature-complete framework stage.
+## Quick start
+
+```bash
+# Build
+cargo build
+
+# Scaffold a new project
+./target/debug/fium init myapp
+cd myapp
+
+# Start serving
+./target/debug/fium serve
+```
+
+Or with the example app:
+
+```bash
+./target/debug/fium serve php/app.php
+```
+
+## Features
+
+**Runtime (Rust)**
+- Worker pool with round-robin dispatch, crash recovery, and max-request recycling
+- TLS/HTTPS via `--tls-cert`/`--tls-key` or `--tls-self-signed` for development
+- Static file serving from a configurable directory
+- Gzip, Brotli, and Zstd response compression
+- Trusted proxy support (`FIUM_TRUSTED_PROXIES`)
+- Configurable request timeouts and body size limits
+- Structured logging with JSON format option
+- Health endpoint (`/health`) with JSON worker statistics
+- Prometheus-compatible metrics (`/_fium/metrics`)
+- File watching with automatic worker restart (`fium dev`)
+- Pretty CLI boot banner with route table
+
+**Framework (PHP)**
+- Concise route format: `'GET /path' => handler`
+- Closure-based inline handlers and class-based handlers
+- Route groups with shared prefix and middleware
+- Named route URL generation (`Application::url()`)
+- Middleware pipeline: session, auth, CSRF, CORS, rate limiting, security headers, role guards, bearer tokens
+- Session storage: file-backed or PDO-backed
+- User storage: file-backed or PDO-backed
+- Cache abstraction: file-backed or PDO-backed
+- Config class with `.env` file loading
+- Input validation with common rules
+- Logger (writes to stderr, captured by runtime)
+- JSON, HTML, text, redirect, and empty response types
+
+## Configuration
+
+Fium works with zero configuration. For customization, create a `fium.toml` next to your `app.php`:
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 3000
+workers = 0           # 0 = auto (CPU count)
+max_requests = 0      # 0 = no limit (worker recycling)
+worker_timeout_ms = 750
+body_max_size = "1mb"
+
+[tls]
+cert = "certs/server.crt"
+key = "certs/server.key"
+
+[log]
+level = "info"        # off, error, warn, info, debug, trace
+format = "pretty"     # pretty, json
+
+[static]
+enabled = true
+dir = "public"
+```
+
+CLI flags override config file values.
 
 ## Layout
 
-- `crates/runtime` - phase 1 Rust runtime spike
-- `crates/transport` - shared transport models for the Rust side
-- `docs/protocol-v1.md` - first transport contract draft
-- `php` - PHP-side package and worker stub
-- `scripts/runtime-baseline.sh` - lightweight sequential latency and RSS probe
-- `scripts/runtime-load.sh` - lightweight concurrent request probe
-- `php/routes.json` - temporary route manifest consumed by the Rust runtime
-- `php/bin/export-routes.php` - temporary route manifest exporter
-- `php/routes.php` - temporary PHP route source with handler references
-- `.agents/PREPARATION.md` - feasibility and product-definition working document
-- `.agents/IMPLEMENTATION_STATUS.md` - implementation progress tracker against the feasibility plan
-
-## Near-term goal
-
-Prove that a Rust binary can supervise PHP workers, exchange normalized request and response envelopes, and keep the developer-facing PHP model lightweight.
-
-## Temporary workflow
-
-Until the PHP routing package exists, route metadata is sourced from `php/routes.php` and exported to `php/routes.json`:
-
-```bash
-php php/bin/export-routes.php
+```
+crates/runtime/     Rust HTTP runtime (fium binary)
+crates/transport/   Shared protocol types (Rust ↔ PHP)
+docs/               Protocol spec and guides
+php/src/            PHP framework source
+php/app.php         Example application
+scripts/            Benchmark probes
 ```
 
-The PHP worker now boots a minimal application contract and dispatches named handlers from the route table.
+## Middleware
 
-Route metadata can also carry route-level middleware aliases, which are resolved inside the PHP application pipeline.
+Built-in middleware aliases:
 
-Unhandled PHP-side exceptions are normalized into structured worker responses instead of crashing the worker loop.
+| Alias | Class | Description |
+|-------|-------|-------------|
+| `session` | `StartSession` | Starts a session |
+| `auth` | `AuthenticateSession` | Requires authenticated session |
+| `bearer` | `AuthenticateBearer` | Authenticates via Bearer token |
+| `csrf` | `VerifyCsrf` | CSRF token verification |
+| `cors` | `Cors` | CORS headers and preflight |
+| `ratelimit:60` | `RateLimit` | Rate limiting per IP (60/min) |
+| `secure` | `SecurityHeaders` | Security headers (nosniff, frame deny, etc.) |
+| `role:admin` | `RequireRole` | Role-based access control |
+| `json` | `RequireJsonAccept` | Requires JSON Accept header |
+| `powered-by` | `AddPoweredByHeader` | Adds X-Fium-Middleware header |
 
-The current PHP spike also includes a minimal file-backed session middleware using the `fium_session` cookie.
+## Compared to
 
-On top of that, the current auth spike supports session-backed login, current-user resolution, a protected `/me` route, and logout using a file-loaded demo user source.
-
-Route metadata can also express simple role guards such as `role:admin` for session-authenticated routes.
-
-State-changing session routes are now protected by a minimal CSRF middleware that validates the `x-csrf-token` header or `_token` JSON field against session state.
-
-The API side now includes a minimal bearer-token login flow with token-protected `/api/me` access using a small HMAC-signed token service.
-
-The route manifest and request contract now also support route parameters such as `/hello/{name}` on the PHP side, and that extraction is now verified through the live Rust matcher.
-
-The current Rust runtime spike now builds and has been smoke-tested over real HTTP for `/health`, `/hello/{name}`, `/api/login`, and `/api/me`.
-
-The runtime now also fails fast if `php/routes.json` is missing, and the live `/_runtime/crash-once` probe has verified that a crashed PHP worker is restarted and the request retried successfully.
-
-The worker supervisor now enforces a default request timeout, supports overriding it via `FIUM_WORKER_TIMEOUT_MS`, and has been exercised through `/_runtime/slow-once` and `/_runtime/always-slow` to verify both timeout recovery and `504 Gateway Timeout` behavior.
+| Feature | Fium | RoadRunner | FrankenPHP |
+|---------|------|------------|------------|
+| Language | Rust + PHP | Go + PHP | Go + PHP |
+| Config | `fium.toml` (optional) | `.rr.yaml` (required) | `Caddyfile` |
+| TLS | Built-in | Built-in + ACME | Automatic (Caddy) |
+| Static files | Built-in | Plugin | Built-in |
+| Compression | gzip/br/zstd | gzip (plugin) | gzip |
+| Metrics | Prometheus | Prometheus | Prometheus |
+| Worker model | Process pool | Process pool | Threads (C module) |
+| PHP dependency | None | Composer package | PHP extension |
+| Binary size | Single binary | Single binary | Single binary |
 
 ## Runtime Probes
 
-Both probe scripts assume the Rust runtime is already running.
-
-Sequential baseline sample:
-
 ```bash
+# Sequential baseline
 ./scripts/runtime-baseline.sh http://127.0.0.1:3000/hello/World 50
-```
 
-Concurrent burst sample:
-
-```bash
+# Concurrent burst
 ./scripts/runtime-load.sh http://127.0.0.1:3000/hello/World 120 12
 ```
 
-Small timeout-heavy burst sample:
+## Documentation
 
-```bash
-./scripts/runtime-load.sh http://127.0.0.1:3000/_runtime/always-slow 12 4
-```
-
-Current local probe notes:
-
-- a 50-request baseline against `/hello/World` averaged about `6.6ms` with `200:50`, with runtime RSS moving from about `4448 KB` to `5160 KB`
-- a 120-request burst at concurrency `12` against `/hello/World` returned `200:120`
-- a 12-request burst at concurrency `4` against `/_runtime/always-slow` returned clean `504:12`, and follow-up normal requests still succeeded
+- [Getting Started](docs/getting-started.md)
+- [Configuration Reference](docs/configuration.md)
+- [Middleware Guide](docs/middleware.md)
+- [Deployment Guide](docs/deployment.md)
+- [Protocol V1 Specification](docs/protocol-v1.md)

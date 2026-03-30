@@ -137,7 +137,7 @@ final class Validator
 
     private function ruleInteger(string $field, mixed $value): ?string
     {
-        if ($value !== null && !is_int($value) && !ctype_digit((string) $value)) {
+        if ($value !== null && !is_int($value) && filter_var($value, FILTER_VALIDATE_INT) === false) {
             return "The {$field} field must be an integer.";
         }
 

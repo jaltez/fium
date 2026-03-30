@@ -86,7 +86,7 @@ final class Authenticator
 
     public function logout(Session $session): void
     {
-        $session->put('auth_user_id', null);
+        $session->forget('auth_user_id');
     }
 
     /** @param array<string, mixed> $record */

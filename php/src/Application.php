@@ -11,8 +11,11 @@ use Fium\Contracts\Middleware;
 use Fium\Middleware\AddPoweredByHeader;
 use Fium\Middleware\AuthenticateBearer;
 use Fium\Middleware\AuthenticateSession;
+use Fium\Middleware\Cors;
+use Fium\Middleware\RateLimit;
 use Fium\Middleware\RequireRole;
 use Fium\Middleware\RequireJsonAccept;
+use Fium\Middleware\SecurityHeaders;
 use Fium\Middleware\StartSession;
 use Fium\Middleware\VerifyCsrf;
 use Fium\Runtime\Request;
@@ -20,6 +23,8 @@ use Fium\Runtime\Response;
 
 final class Application
 {
+    private static ?self $instance = null;
+
     /** @var array<string, callable> handler by route name (closures or class-string) */
     private array $handlers;
 
@@ -44,8 +49,11 @@ final class Application
             'add-powered-by' => AddPoweredByHeader::class,
             'auth-bearer' => AuthenticateBearer::class,
             'auth-session' => AuthenticateSession::class,
+            'cors' => Cors::class,
+            'ratelimit' => RateLimit::class,
             'require-json' => RequireJsonAccept::class,
             'role' => RequireRole::class,
+            'security-headers' => SecurityHeaders::class,
             'start-session' => StartSession::class,
             'verify-csrf' => VerifyCsrf::class,
             // Short aliases
@@ -55,6 +63,7 @@ final class Application
             'json' => RequireJsonAccept::class,
             'session' => StartSession::class,
             'csrf' => VerifyCsrf::class,
+            'secure' => SecurityHeaders::class,
         ];
         $this->debug = self::resolveDebugMode();
 
@@ -79,6 +88,8 @@ final class Application
             $this->authenticator = Authenticator::empty();
         }
         $this->tokenService = ApiTokenService::boot($this->authenticator);
+
+        self::$instance = $this;
     }
 
     public static function boot(string $routesPath): self
@@ -99,6 +110,40 @@ final class Application
     public function baseDir(): string
     {
         return $this->baseDir;
+    }
+
+    /**
+     * Generate a URL for a named route with parameter substitution.
+     *
+        * @param array<string, scalar> $params
+     */
+    public static function url(string $routeName, array $params = []): string
+    {
+        if (self::$instance === null) {
+            throw new \RuntimeException('Application not booted.');
+        }
+
+        $route = self::$instance->routeMap[$routeName] ?? null;
+        if ($route === null) {
+            throw new \RuntimeException("Route '{$routeName}' not found.");
+        }
+
+        $path = $route['path'];
+        preg_match_all('/\{([^}]+)\}/', $path, $matches);
+
+        foreach ($matches[1] as $parameterName) {
+            if (!array_key_exists($parameterName, $params)) {
+                throw new \RuntimeException("Missing route parameter '{$parameterName}' for route '{$routeName}'.");
+            }
+
+            $path = str_replace(
+                '{' . $parameterName . '}',
+                rawurlencode((string) $params[$parameterName]),
+                $path
+            );
+        }
+
+        return $path;
     }
 
     /**
@@ -135,7 +180,7 @@ final class Application
                 return Response::json([
                     'ok' => false,
                     'error' => 'route_not_resolved',
-                ], 404, $requestId)->toWorkerResponse();
+                ], 404, $requestId)->toWorkerResponse($requestId);
             }
 
             $route = $this->routeMap[$routeName];
@@ -230,7 +275,7 @@ final class Application
         // 1. Closure or callable  → handler with no middleware
         // 2. string (class name)  → handler with no middleware
         // 3. array with 'handler' + optional 'middleware'
-        if ($value instanceof \Closure || (is_string($value) && !is_array($value))) {
+        if ($value instanceof \Closure || is_string($value)) {
             $handler = $value;
             $middleware = $groupMiddleware;
         } elseif (is_array($value) && isset($value['handler'])) {

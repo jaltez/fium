@@ -15,7 +15,12 @@ final class ApiTokenService
 
     public static function boot(Authenticator $authenticator): self
     {
-        $secret = \Fium\Config::get('FIUM_API_TOKEN_SECRET', 'fium-dev-api-secret');
+        $secret = \Fium\Config::get('FIUM_API_TOKEN_SECRET');
+
+        if ($secret === null || $secret === '') {
+            $secret = 'fium-dev-api-secret';
+            fwrite(STDERR, "[fium] WARNING: FIUM_API_TOKEN_SECRET is not set, using insecure default. Set it in .env for production.\n");
+        }
 
         return new self($authenticator, $secret, 3600);
     }
