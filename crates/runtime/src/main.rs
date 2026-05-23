@@ -4,6 +4,7 @@ mod route;
 mod worker;
 
 use anyhow::anyhow;
+use arc_swap::ArcSwap;
 use axum::{
     body::{to_bytes, Body},
     extract::{ConnectInfo, Request, State},
@@ -17,8 +18,9 @@ use config::{LogFormat, RuntimeConfig};
 use fium_transport::{CookieMap, HeaderMap, SetCookie, WorkerRequest, PROTOCOL_VERSION};
 use route::RouteTable;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
-use tokio::sync::RwLock;
 use tokio::time::Duration;
+use tower_http::compression::{CompressionLayer, predicate::SizeAbove};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use worker::WorkerPool;
@@ -86,7 +88,7 @@ enum Cli {
 
 #[derive(Clone)]
 struct AppState {
-    routes: Arc<RwLock<RouteTable>>,
+    routes: Arc<ArcSwap<RouteTable>>,
     pool: WorkerPool,
     config: Arc<RuntimeConfig>,
     start_time: Instant,
@@ -210,7 +212,7 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
     let config = Arc::new(cfg);
 
     let state = AppState {
-        routes: Arc::new(RwLock::new(routes)),
+        routes: Arc::new(ArcSwap::from_pointee(routes)),
         pool,
         config: config.clone(),
         start_time: Instant::now(),
@@ -253,7 +255,11 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
             shutdown_signal().await;
             handle_for_signal.graceful_shutdown(Some(Duration::from_secs(5)));
         });
-        axum_server::bind_rustls(address, rustls_config)
+
+        let tcp = std::net::TcpListener::bind(address)?;
+        let _ = tcp.set_nonblocking(true);
+
+        axum_server::from_tcp_rustls(tcp, rustls_config)
             .handle(handle)
             .serve(app)
             .await?;
@@ -261,12 +267,19 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
         let scheme = "http";
         info!(%address, %scheme, "starting runtime");
 
-        let listener = tokio::net::TcpListener::bind(address).await?;
-        axum::serve(
-            listener,
-            app,
-        )
-            .with_graceful_shutdown(shutdown_signal())
+        let tcp = std::net::TcpListener::bind(address)?;
+        let _ = tcp.set_nonblocking(true);
+
+        let handle = axum_server::Handle::new();
+        let handle_for_signal = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            handle_for_signal.graceful_shutdown(Some(Duration::from_secs(5)));
+        });
+
+        axum_server::from_tcp(tcp)
+            .handle(handle)
+            .serve(app)
             .await?;
     }
 
@@ -373,17 +386,33 @@ fn build_router(state: AppState, config: &RuntimeConfig) -> axum::extract::conne
         .fallback(dispatch)
         .with_state(state);
 
+    // Cache-Control for static assets — 1 hour by default, immutable for hashed assets works too.
+    let cache_header = axum::http::HeaderValue::from_static("public, max-age=3600");
+
     if config.static_enabled {
         if let Some(ref static_dir) = config.static_dir {
             if static_dir.is_dir() {
                 info!(dir = %static_dir.display(), "serving static files");
+                let serve_dir = tower_http::services::ServeDir::new(static_dir)
+                    .precompressed_gzip()
+                    .precompressed_br();
                 app = Router::new()
-                    .nest_service("/", tower_http::services::ServeDir::new(static_dir).fallback(app.into_service()));
+                    .nest_service(
+                        "/",
+                        serve_dir.fallback(app.into_service()),
+                    )
+                    .layer(SetResponseHeaderLayer::overriding(
+                        axum::http::header::CACHE_CONTROL,
+                        cache_header,
+                    ));
             }
         }
     }
 
-    app.layer(tower_http::compression::CompressionLayer::new())
+    app.layer(
+        CompressionLayer::new()
+            .compress_when(SizeAbove::new(256))
+    )
         .into_make_service_with_connect_info::<SocketAddr>()
 }
 
@@ -396,14 +425,14 @@ async fn dispatch(
     let method = request.method().to_string();
 
     let route_match = {
-        let routes = state.routes.read().await;
+        let routes = state.routes.load();
         routes.match_route(&method, &path)
     };
 
     let Some(route_match) = route_match else {
         return (StatusCode::NOT_FOUND, "route not found").into_response();
     };
-    let route = route_match.route;
+    let route_name = &route_match.route_name;
 
     let request_id = format!("req_{}", Uuid::new_v4().simple());
     let start = Instant::now();
@@ -445,17 +474,23 @@ async fn dispatch(
     let headers = normalize_headers(request.headers());
     let cookies = parse_cookies(request.headers());
     let body_max = state.config.body_max_size;
-    let body_bytes = match to_bytes(request.into_body(), body_max).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            error!(%error, request_id, "failed to read request body");
-            return (StatusCode::BAD_REQUEST, "invalid request body").into_response();
-        }
-    };
-    let body = if body_bytes.is_empty() {
+
+    // Skip body buffering for methods that never carry a payload.
+    let body = if matches!(method.as_str(), "GET" | "HEAD") {
         None
     } else {
-        Some(String::from_utf8_lossy(&body_bytes).to_string())
+        let body_bytes = match to_bytes(request.into_body(), body_max).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                error!(%error, request_id, "failed to read request body");
+                return (StatusCode::BAD_REQUEST, "invalid request body").into_response();
+            }
+        };
+        if body_bytes.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&body_bytes).to_string())
+        }
     };
 
     let worker_request = WorkerRequest {
@@ -472,7 +507,7 @@ async fn dispatch(
         host,
         client_ip: Some(client_ip),
         is_secure,
-        matched_route: Some(route.name.clone()),
+        matched_route: Some(route_name.clone()),
     };
 
     let log_method = worker_request.method.clone();
@@ -523,7 +558,7 @@ async fn dispatch(
                 %error_message,
                 method = %log_method,
                 path = %log_path,
-                route = %route.name,
+                route = %route_name,
                 latency_ms = elapsed.as_secs_f64() * 1000.0,
                 %request_id,
                 "worker dispatch failed"
@@ -616,7 +651,7 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
     eprintln!();
 
     let config = Arc::new(cfg);
-    let routes = Arc::new(RwLock::new(routes));
+    let routes = Arc::new(ArcSwap::from_pointee(routes));
 
     let state = AppState {
         routes: routes.clone(),
@@ -658,7 +693,7 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
             eprintln!("  \x1b[33m[reload]\x1b[0m PHP file changed, restarting workers...");
             match pool_for_watcher.reload().await {
                 Ok(new_routes) => {
-                    *routes_for_watcher.write().await = new_routes;
+                    routes_for_watcher.store(Arc::new(new_routes));
                     eprintln!("  \x1b[32m[reload]\x1b[0m workers restarted");
                 }
                 Err(error) => {
@@ -670,12 +705,19 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
     });
 
     let address: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(
-        listener,
-        app,
-    )
-        .with_graceful_shutdown(shutdown_signal())
+    let tcp = std::net::TcpListener::bind(address)?;
+    let _ = tcp.set_nonblocking(true);
+
+    let handle = axum_server::Handle::new();
+    let handle_for_signal = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        handle_for_signal.graceful_shutdown(Some(Duration::from_secs(5)));
+    });
+
+    axum_server::from_tcp(tcp)
+        .handle(handle)
+        .serve(app)
         .await?;
 
     Ok(())

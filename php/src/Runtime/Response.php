@@ -21,14 +21,14 @@ final class Response
     /** @param array<string, mixed> $payload */
     public static function json(array $payload, int $status = 200, ?string $requestId = null): self
     {
-        $json = json_encode($payload);
+        $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 
         if ($json === false) {
             return new self(500, ['content-type' => ['application/json']], json_encode([
                 'ok' => false,
                 'error' => 'json_encoding_failed',
                 'request_id' => $requestId,
-            ]) ?: null, ['kind' => 'json_encoding_failed', 'message' => 'Failed to encode JSON response']);
+            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: null, ['kind' => 'json_encoding_failed', 'message' => 'Failed to encode JSON response']);
         }
 
         return new self($status, ['content-type' => ['application/json']], $json);
@@ -80,7 +80,7 @@ final class Response
         return new self(
             500,
             ['content-type' => ['application/json']],
-            json_encode($payload) ?: '{"ok":false,"error":"internal_server_error"}',
+            json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{"ok":false,"error":"internal_server_error"}',
             [
                 'kind' => 'internal_server_error',
                 'message' => $debug ? $throwable->getMessage() : 'Unhandled application exception',
@@ -90,12 +90,11 @@ final class Response
 
     public function withHeader(string $name, string $value): self
     {
-        $clone = clone $this;
         $normalized = strtolower($name);
-        $clone->headers[$normalized] ??= [];
-        $clone->headers[$normalized][] = $value;
+        $this->headers[$normalized] ??= [];
+        $this->headers[$normalized][] = $value;
 
-        return $clone;
+        return $this;
     }
 
     public function withCookie(
@@ -107,8 +106,7 @@ final class Response
         ?string $sameSite = 'Lax',
         ?int $maxAge = null,
     ): self {
-        $clone = clone $this;
-        $clone->cookies[] = [
+        $this->cookies[] = [
             'name' => $name,
             'value' => $value,
             'path' => $path,
@@ -118,7 +116,7 @@ final class Response
             'max_age' => $maxAge,
         ];
 
-        return $clone;
+        return $this;
     }
 
     /** @return array<string, mixed> */

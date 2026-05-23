@@ -2,7 +2,7 @@ use fium_transport::{BootMessage, WorkerRequest, WorkerResponse, PROTOCOL_VERSIO
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    sync::{mpsc, oneshot, Mutex},
     time::{timeout, Duration},
 };
 use tracing::{info, warn};
@@ -11,6 +11,17 @@ use std::{path::PathBuf, sync::Arc};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::route::RouteTable;
+
+// Messages sent from WorkerSupervisor::handle() to the per-worker background task.
+enum WorkerMessage {
+    Request {
+        request: WorkerRequest,
+        reply: oneshot::Sender<Result<WorkerResponse, String>>,
+    },
+    Restart {
+        reply: oneshot::Sender<()>,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkerSupervisor {
@@ -21,6 +32,8 @@ pub struct WorkerSupervisor {
     boot_timeout: Duration,
     max_requests: u64,
     process: Arc<Mutex<Option<WorkerProcess>>>,
+    tx: mpsc::UnboundedSender<WorkerMessage>,
+    pending: Arc<AtomicUsize>,
     requests_handled: Arc<AtomicU64>,
     restarts: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
@@ -41,18 +54,63 @@ impl WorkerSupervisor {
         max_requests: u64,
     ) -> Self {
         let timeout_ms = if request_timeout_ms > 0 { request_timeout_ms } else { 750 };
-        Self {
+        let process = Arc::new(Mutex::new(None));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let requests_handled = Arc::new(AtomicU64::new(0));
+        let restarts = Arc::new(AtomicU64::new(0));
+        let errors = Arc::new(AtomicU64::new(0));
+
+        let supervisor = Self {
             php_binary: "php".to_string(),
             worker_entrypoint: PathBuf::from(worker_entrypoint.into()),
             app_file: PathBuf::from(app_file.into()),
             request_timeout: Duration::from_millis(timeout_ms),
             boot_timeout: Duration::from_secs(10),
             max_requests,
-            process: Arc::new(Mutex::new(None)),
-            requests_handled: Arc::new(AtomicU64::new(0)),
-            restarts: Arc::new(AtomicU64::new(0)),
-            errors: Arc::new(AtomicU64::new(0)),
-        }
+            process: process.clone(),
+            tx,
+            pending: pending.clone(),
+            requests_handled: requests_handled.clone(),
+            restarts: restarts.clone(),
+            errors: errors.clone(),
+        };
+
+        // Spawn the per-worker background task that owns request processing.
+        let php_binary = supervisor.php_binary.clone();
+        let worker_entrypoint = supervisor.worker_entrypoint.clone();
+        let app_file = supervisor.app_file.clone();
+        let request_timeout = supervisor.request_timeout;
+        let boot_timeout = supervisor.boot_timeout;
+        let max_requests = supervisor.max_requests;
+
+        tokio::spawn(async move {
+            let mut rx = rx;
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    WorkerMessage::Request { request, reply } => {
+                        let result = Self::process_request(
+                            &php_binary, &worker_entrypoint, &app_file,
+                            request_timeout, boot_timeout, max_requests,
+                            &process, &request,
+                            &requests_handled, &restarts, &errors,
+                        ).await;
+                        let _ = reply.send(result);
+                    }
+                    WorkerMessage::Restart { reply } => {
+                        let mut slot = process.lock().await;
+                        Self::kill_process(&mut slot).await;
+                        let _ = reply.send(());
+                    }
+                }
+            }
+        });
+
+        supervisor
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.load(Ordering::Relaxed)
     }
 
     pub fn requests_handled(&self) -> u64 {
@@ -114,42 +172,86 @@ impl WorkerSupervisor {
         RouteTable::from_boot_routes(boot.routes)
     }
 
+    /// Queue a request to be processed by this worker. Returns immediately;
+    /// the response arrives via the oneshot when the background task finishes.
     pub async fn handle(&self, request: WorkerRequest) -> Result<WorkerResponse, String> {
-        let mut process = self.process.lock().await;
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self.tx.send(WorkerMessage::Request { request, reply: reply_tx }).is_err() {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+            return Err("worker has shut down".to_string());
+        }
+        let result = reply_rx.await.map_err(|_| "worker task terminated".to_string())?;
+        self.pending.fetch_sub(1, Ordering::Relaxed);
+        result
+    }
+
+    /// Process a single request (called from the background task).
+    async fn process_request(
+        php_binary: &str,
+        worker_entrypoint: &PathBuf,
+        app_file: &PathBuf,
+        request_timeout: Duration,
+        boot_timeout: Duration,
+        max_requests: u64,
+        process: &Arc<Mutex<Option<WorkerProcess>>>,
+        request: &WorkerRequest,
+        requests_handled: &Arc<AtomicU64>,
+        restarts: &Arc<AtomicU64>,
+        errors: &Arc<AtomicU64>,
+    ) -> Result<WorkerResponse, String> {
+        let mut slot = process.lock().await;
 
         // Check if worker needs recycling due to max_requests
-        if self.max_requests > 0 {
-            let handled = self.requests_handled.load(Ordering::Relaxed);
-            if handled > 0 && handled % self.max_requests == 0 {
-                info!(handled, max_requests = self.max_requests, "recycling worker after max_requests");
-                self.restart_locked(&mut process).await?;
-                self.restarts.fetch_add(1, Ordering::Relaxed);
+        if max_requests > 0 {
+            let handled = requests_handled.load(Ordering::Relaxed);
+            if handled > 0 && handled % max_requests == 0 {
+                info!(handled, max_requests, "recycling worker after max_requests");
+                Self::kill_and_restart(
+                    php_binary, worker_entrypoint, app_file,
+                    boot_timeout, &mut slot,
+                ).await?;
+                restarts.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        match self.dispatch_once_locked(&mut process, &request).await {
+        match Self::dispatch_once(
+            php_binary, worker_entrypoint, app_file,
+            request_timeout, boot_timeout,
+            &mut slot, request,
+        ).await {
             Ok(response) => {
-                self.requests_handled.fetch_add(1, Ordering::Relaxed);
+                requests_handled.fetch_add(1, Ordering::Relaxed);
                 Ok(response)
             }
             Err(first_error) => {
-                self.errors.fetch_add(1, Ordering::Relaxed);
+                errors.fetch_add(1, Ordering::Relaxed);
                 warn!(%first_error, "worker request failed, attempting restart");
-                self.restart_locked(&mut process).await?;
-                self.restarts.fetch_add(1, Ordering::Relaxed);
+                Self::kill_and_restart(
+                    php_binary, worker_entrypoint, app_file,
+                    boot_timeout, &mut slot,
+                ).await?;
+                restarts.fetch_add(1, Ordering::Relaxed);
 
-                match self.dispatch_once_locked(&mut process, &request).await {
+                match Self::dispatch_once(
+                    php_binary, worker_entrypoint, app_file,
+                    request_timeout, boot_timeout,
+                    &mut slot, request,
+                ).await {
                     Ok(response) => {
-                        self.requests_handled.fetch_add(1, Ordering::Relaxed);
+                        requests_handled.fetch_add(1, Ordering::Relaxed);
                         Ok(response)
                     }
                     Err(second_error) => {
-                        self.errors.fetch_add(1, Ordering::Relaxed);
+                        errors.fetch_add(1, Ordering::Relaxed);
                         warn!(%second_error, "worker request failed after restart, replacing worker before returning error");
 
-                        match self.restart_locked(&mut process).await {
+                        match Self::kill_and_restart(
+                            php_binary, worker_entrypoint, app_file,
+                            boot_timeout, &mut slot,
+                        ).await {
                             Ok(()) => {
-                                self.restarts.fetch_add(1, Ordering::Relaxed);
+                                restarts.fetch_add(1, Ordering::Relaxed);
                                 Err(second_error)
                             }
                             Err(restart_error) => Err(format!(
@@ -162,17 +264,21 @@ impl WorkerSupervisor {
         }
     }
 
-    async fn dispatch_once_locked(
-        &self,
+    async fn dispatch_once(
+        _php_binary: &str,
+        _worker_entrypoint: &PathBuf,
+        _app_file: &PathBuf,
+        request_timeout: Duration,
+        _boot_timeout: Duration,
         slot: &mut Option<WorkerProcess>,
         request: &WorkerRequest,
     ) -> Result<WorkerResponse, String> {
-        let process = self.ensure_started(slot).await?;
+        let process = Self::ensure_started(slot).await?;
 
         let encoded = serde_json::to_string(request)
             .map_err(|error| format!("failed to encode worker request: {error}"))?;
 
-        timeout(self.request_timeout, async {
+        timeout(request_timeout, async {
             process
                 .stdin
                 .write_all(encoded.as_bytes())
@@ -194,18 +300,18 @@ impl WorkerSupervisor {
             format!(
                 "worker request timed out while writing request {} after {} ms",
                 request.request_id,
-                self.request_timeout.as_millis()
+                request_timeout.as_millis()
             )
         })??;
 
         let mut line = String::new();
-        let bytes_read = timeout(self.request_timeout, process.stdout.read_line(&mut line))
+        let bytes_read = timeout(request_timeout, process.stdout.read_line(&mut line))
             .await
             .map_err(|_| {
                 format!(
                     "worker request timed out while reading response {} after {} ms",
                     request.request_id,
-                    self.request_timeout.as_millis()
+                    request_timeout.as_millis()
                 )
             })?
             .map_err(|error| format!("failed to read worker response: {error}"))?;
@@ -234,7 +340,28 @@ impl WorkerSupervisor {
         Ok(response)
     }
 
-    async fn restart_locked(&self, slot: &mut Option<WorkerProcess>) -> Result<(), String> {
+    async fn kill_and_restart(
+        php_binary: &str,
+        worker_entrypoint: &PathBuf,
+        app_file: &PathBuf,
+        boot_timeout: Duration,
+        slot: &mut Option<WorkerProcess>,
+    ) -> Result<(), String> {
+        Self::kill_process(slot).await;
+        *slot = None;
+
+        let mut worker = Self::spawn_worker_cfg(php_binary, worker_entrypoint, app_file).await?;
+        // Consume the boot message that every new PHP worker emits on startup.
+        let mut boot_line = String::new();
+        timeout(boot_timeout, worker.stdout.read_line(&mut boot_line))
+            .await
+            .map_err(|_| "timed out waiting for boot message from restarted worker".to_string())?
+            .map_err(|error| format!("failed to read boot message from restarted worker: {error}"))?;
+        *slot = Some(worker);
+        Ok(())
+    }
+
+    async fn kill_process(slot: &mut Option<WorkerProcess>) {
         if let Some(existing) = slot.as_mut() {
             if let Err(error) = existing.child.start_kill() {
                 warn!(%error, "failed to signal worker kill during restart");
@@ -244,65 +371,50 @@ impl WorkerSupervisor {
                     Ok(Err(error)) => {
                         warn!(%error, "failed while waiting for worker exit during restart");
                     }
-                    Err(error) => {
-                        warn!(?error, "timed out waiting for worker exit during restart");
+                    Err(_) => {
+                        warn!("timed out waiting for worker exit during restart");
                     }
                 }
             }
         }
-
-        *slot = None;
-        Ok(())
     }
 
     async fn ensure_started<'a>(
-        &self,
         slot: &'a mut Option<WorkerProcess>,
     ) -> Result<&'a mut WorkerProcess, String> {
-        let needs_start = match slot.as_mut() {
-            Some(process) => match process.child.try_wait() {
-                Ok(Some(status)) => {
-                    warn!(?status, "worker exited, starting a new one");
-                    true
-                }
-                Ok(None) => false,
-                Err(error) => {
-                    warn!(%error, "failed to inspect worker status, restarting");
-                    true
-                }
-            },
-            None => true,
-        };
-
-        if needs_start {
-            let mut worker = self.spawn_worker().await?;
-            // Consume the boot message that every new PHP worker emits on startup.
-            let mut boot_line = String::new();
-            timeout(self.boot_timeout, worker.stdout.read_line(&mut boot_line))
-                .await
-                .map_err(|_| "timed out waiting for boot message from restarted worker".to_string())?
-                .map_err(|error| format!("failed to read boot message from restarted worker: {error}"))?;
-            *slot = Some(worker);
-        }
-
+        // The retry logic in process_request handles worker failures.
+        // If the worker died between writes, we'll get an I/O error and restart.
+        // No need for a try_wait() syscall on every request.
         slot.as_mut()
-            .ok_or_else(|| "worker process unavailable after startup".to_string())
+            .ok_or_else(|| "worker process unavailable".to_string())
     }
 
     async fn spawn_worker(&self) -> Result<WorkerProcess, String> {
-        info!(entrypoint = %self.worker_entrypoint.display(), "starting PHP worker process");
+        Self::spawn_worker_cfg(
+            &self.php_binary,
+            &self.worker_entrypoint,
+            &self.app_file,
+        ).await
+    }
 
-        let mut child = Command::new(&self.php_binary)
-            .arg(&self.worker_entrypoint)
-            .arg(&self.app_file)
+    async fn spawn_worker_cfg(
+        php_binary: &str,
+        worker_entrypoint: &PathBuf,
+        app_file: &PathBuf,
+    ) -> Result<WorkerProcess, String> {
+        info!(entrypoint = %worker_entrypoint.display(), "starting PHP worker process");
+
+        let mut child = Command::new(php_binary)
+            .arg(worker_entrypoint)
+            .arg(app_file)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .map_err(|error| format!(
                 "failed to spawn PHP worker using '{}' and '{}': {error}",
-                self.php_binary,
-                self.worker_entrypoint.display()
+                php_binary,
+                worker_entrypoint.display()
             ))?;
 
         let stdin = child
@@ -321,11 +433,11 @@ impl WorkerSupervisor {
         })
     }
 }
-/// A pool of PHP worker processes that distributes requests round-robin.
+
+/// A pool of PHP worker processes that distributes requests to the least-loaded worker.
 #[derive(Clone)]
 pub struct WorkerPool {
     workers: Arc<Vec<WorkerSupervisor>>,
-    next: Arc<AtomicUsize>,
 }
 
 impl WorkerPool {
@@ -346,7 +458,6 @@ impl WorkerPool {
 
         Self {
             workers: Arc::new(workers),
-            next: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -360,41 +471,54 @@ impl WorkerPool {
         self.boot().await
     }
 
-    /// Boot the first worker and get the route table, then boot the remaining workers.
+    /// Boot all workers in parallel. The first successful boot provides
+    /// the route table; remaining boots complete asynchronously.
+    /// Boot all workers in parallel. The first successful boot provides
+    /// the route table; remaining boots complete asynchronously.
     pub async fn boot(&self) -> Result<RouteTable, String> {
-        // Boot the first worker to discover routes
-        let routes = self.workers[0].boot().await?;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let count = self.workers.len();
 
-        // Boot remaining workers in parallel
-        let mut handles = Vec::new();
-        for worker in self.workers.iter().skip(1) {
+        for worker in self.workers.iter() {
             let worker = worker.clone();
-            handles.push(tokio::spawn(async move { worker.boot().await }));
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(worker.boot().await);
+            });
+        }
+        // Drop the last sender so recv completes when all workers fail.
+        drop(tx);
+
+        let mut last_err = String::new();
+        let mut successes = 0;
+
+        while let Some(result) = rx.recv().await {
+            match result {
+                Ok(routes) => {
+                    successes += 1;
+                    if successes == 1 {
+                        info!(workers = count, "first worker booted, routes discovered");
+                        return Ok(routes);
+                    }
+                }
+                Err(e) => {
+                    last_err = e;
+                }
+            }
         }
 
-        for handle in handles {
-            handle
-                .await
-                .map_err(|error| format!("worker boot task panicked: {error}"))?
-                .map_err(|error| format!("worker boot failed: {error}"))?;
-        }
-
-        info!(workers = self.workers.len(), "all workers booted");
-
-        Ok(routes)
+        Err(format!("all workers failed to boot: {last_err}"))
     }
 
     /// Restart all workers (used by dev mode file watcher).
     pub async fn restart_all(&self) {
         let mut handles = Vec::new();
         for worker in self.workers.iter() {
-            let worker = worker.clone();
+            let tx = worker.tx.clone();
             handles.push(tokio::spawn(async move {
-                let mut process = worker.process.lock().await;
-                if let Err(e) = worker.restart_locked(&mut process).await {
-                    warn!(%e, "failed to restart worker during reload");
-                }
-                // ensure_started will re-spawn on next request
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = tx.send(WorkerMessage::Restart { reply: reply_tx });
+                let _ = reply_rx.await;
             }));
         }
         for handle in handles {
@@ -402,9 +526,14 @@ impl WorkerPool {
         }
     }
 
-    /// Dispatch a request to the next available worker (round-robin).
+    /// Dispatch a request to the worker with the fewest in-flight requests.
     pub async fn handle(&self, request: WorkerRequest) -> Result<WorkerResponse, String> {
-        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        let index = self.workers.iter()
+            .enumerate()
+            .min_by_key(|(_, w)| w.pending_count())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
         self.workers[index].handle(request).await
     }
 }

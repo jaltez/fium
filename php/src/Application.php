@@ -28,11 +28,14 @@ final class Application
     /** @var array<string, callable> handler by route name (closures or class-string) */
     private array $handlers;
 
-    /** @var array<string, array{method: string, path: string, name: string, middleware: list<string>}> */
+    /** @var array<string, array{method: string, path: string, name: string, middleware: list<string>, _chain: callable}> */
     private array $routeMap;
 
     /** @var array<string, class-string<Middleware>> */
     private array $middlewareAliases;
+
+    /** @var array<string, Middleware> singleton middleware instances keyed by alias */
+    private array $middlewareCache = [];
 
     private string $baseDir;
     private Authenticator $authenticator;
@@ -166,7 +169,7 @@ final class Application
             'protocol_version' => 1,
             'type' => 'boot',
             'routes' => $routes,
-        ], JSON_THROW_ON_ERROR);
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
     }
 
     /** @param array<string, mixed> $workerRequest */
@@ -184,18 +187,23 @@ final class Application
             }
 
             $route = $this->routeMap[$routeName];
-            $handler = $this->resolveHandler($routeName);
             $request = Request::fromWorkerPayload($workerRequest);
             $request->setAttribute('route_name', $routeName);
             $request->setAttribute('authenticator', $this->authenticator);
             $request->setAttribute('token_service', $this->tokenService);
             $request->setAttribute('base_dir', $this->baseDir);
 
-            $response = $this->dispatchThroughMiddleware(
-                $request,
-                $handler,
-                $this->resolveMiddleware($route)
-            );
+            // Compile middleware chain lazily on first hit per route, then reuse
+            if (!isset($route['_chain'])) {
+                $handler = $this->resolveHandler($routeName);
+                $this->routeMap[$routeName]['_chain'] = $this->compileChain(
+                    $route['middleware'] ?? [],
+                    $handler
+                );
+            }
+
+            $chain = $this->routeMap[$routeName]['_chain'];
+            $response = $chain($request);
 
             return $response->toWorkerResponse($requestId);
         } catch (\Throwable $throwable) {
@@ -326,15 +334,28 @@ final class Application
     }
 
     /**
-     * @param array{middleware?: list<string>} $route
-     * @return list<Middleware>
+     * Compile a middleware chain once, caching singleton middleware instances.
+     * The chain closure bakes in the final handler so it can be called with just a Request.
+     *
+     * @param list<string> $middlewareAliases
+     * @return callable(Request): Response
      */
-    private function resolveMiddleware(array $route): array
+    private function compileChain(array $middlewareAliases, callable $handler): callable
     {
-        $resolved = [];
+        if (empty($middlewareAliases)) {
+            return $handler;
+        }
 
-        foreach (($route['middleware'] ?? []) as $alias) {
+        // Resolve middleware instances (singletons from cache)
+        $stack = [];
+        foreach ($middlewareAliases as $alias) {
             $alias = (string) $alias;
+
+            if (isset($this->middlewareCache[$alias])) {
+                $stack[] = $this->middlewareCache[$alias];
+                continue;
+            }
+
             [$middlewareName, $middlewareArgument] = array_pad(explode(':', $alias, 2), 2, null);
             $middlewareClass = $this->middlewareAliases[$middlewareName] ?? null;
 
@@ -342,26 +363,22 @@ final class Application
                 throw new \RuntimeException("Unknown middleware alias '{$alias}'.");
             }
 
-            $resolved[] = $middlewareArgument === null
+            $instance = $middlewareArgument === null
                 ? new $middlewareClass()
                 : new $middlewareClass($middlewareArgument);
+
+            $this->middlewareCache[$alias] = $instance;
+            $stack[] = $instance;
         }
 
-        return $resolved;
-    }
-
-    /**
-     * @param list<Middleware> $middlewareStack
-     */
-    private function dispatchThroughMiddleware(Request $request, callable $handler, array $middlewareStack): Response
-    {
-        $next = static fn (Request $request): Response => $handler($request);
-
-        foreach (array_reverse($middlewareStack) as $middleware) {
-            $previousNext = $next;
-            $next = static fn (Request $request): Response => $middleware->handle($request, $previousNext);
+        // Build closure chain from inside out (rightmost middleware is deepest).
+        $next = $handler;
+        for ($i = count($stack) - 1; $i >= 0; $i--) {
+            $previous = $next;
+            $middleware = $stack[$i];
+            $next = static fn (Request $request): Response => $middleware->handle($request, $previous);
         }
 
-        return $next($request);
+        return $next;
     }
 }

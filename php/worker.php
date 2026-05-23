@@ -44,15 +44,31 @@ while (($line = fgets($stdin)) !== false) {
             'status' => 500,
             'headers' => ['content-type' => ['application/json']],
             'cookies' => [],
-            'body' => json_encode(['ok' => false, 'error' => 'invalid_request']),
+            'body' => '{"ok":false,"error":"invalid_request"}',
             'error' => ['kind' => 'invalid_request', 'message' => 'Malformed request frame'],
-        ]) . PHP_EOL);
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . PHP_EOL);
+        fflush($stdout);
+        continue;
+    }
+
+    // Validate protocol version before dispatching.
+    $protocolVersion = isset($request['protocol_version']) ? (int) $request['protocol_version'] : 0;
+    if ($protocolVersion !== 1) {
+        fwrite($stdout, json_encode([
+            'protocol_version' => 1,
+            'request_id' => $request['request_id'] ?? null,
+            'status' => 500,
+            'headers' => ['content-type' => ['application/json']],
+            'cookies' => [],
+            'body' => '{"ok":false,"error":"protocol_version_mismatch"}',
+            'error' => ['kind' => 'protocol_version_mismatch', 'message' => "Protocol version {$protocolVersion} is not supported"],
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . PHP_EOL);
         fflush($stdout);
         continue;
     }
 
     $response = $application->handleWorkerRequest($request);
 
-    fwrite($stdout, json_encode($response) . PHP_EOL);
+    fwrite($stdout, json_encode($response, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . PHP_EOL);
     fflush($stdout);
 }

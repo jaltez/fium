@@ -82,7 +82,8 @@ final class PdoSessionStore implements SessionStore
             return null;
         }
 
-        if (!preg_match('/^[a-f0-9]{16,64}$/', $sessionId)) {
+        $len = strlen($sessionId);
+        if ($len < 16 || $len > 64 || !ctype_xdigit($sessionId)) {
             return null;
         }
 

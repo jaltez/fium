@@ -1,21 +1,24 @@
 use fium_transport::BootRoute;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
     pub method: String,
-    pub path: String,
     pub name: String,
+    pub path: String,
+    pub is_static: bool,
+    pub segments: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RouteTable {
-    routes: Vec<RouteEntry>,
+    /// Routes keyed by HTTP method for O(1) lookup per method.
+    by_method: HashMap<String, Vec<RouteEntry>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RouteMatch {
-    pub route: RouteEntry,
+    pub route_name: String,
     pub params: BTreeMap<String, String>,
 }
 
@@ -25,59 +28,101 @@ impl RouteTable {
             return Err("worker boot message contained no routes".to_string());
         }
 
-        let routes = boot_routes
-            .into_iter()
-            .map(|br| RouteEntry {
-                method: br.method,
-                path: br.path,
-                name: br.name,
-            })
-            .collect();
+        let mut by_method: HashMap<String, Vec<RouteEntry>> = HashMap::new();
 
-        Ok(Self { routes })
+        for br in boot_routes {
+            let is_static = !br.path.contains('{');
+            let segments = if is_static {
+                Vec::new() // static routes skip segment splitting
+            } else {
+                split_segments_owned(&br.path)
+            };
+
+            let methods = by_method.entry(br.method).or_default();
+            // Push static routes first so the fast-path hits early.
+            if is_static {
+                methods.insert(0, RouteEntry {
+                    method: String::new(), // filled below
+                    name: br.name,
+                    path: br.path,
+                    is_static,
+                    segments,
+                });
+            } else {
+                methods.push(RouteEntry {
+                    method: String::new(),
+                    name: br.name,
+                    path: br.path,
+                    is_static,
+                    segments,
+                });
+            }
+        }
+
+        // Fill in the method field (won't compile without clone, do it after).
+        for (method, routes) in by_method.iter_mut() {
+            for route in routes.iter_mut() {
+                route.method = method.clone();
+            }
+        }
+
+        Ok(Self { by_method })
     }
 
-    /// Return a list of (method, path, name) for the boot banner.
     pub fn list(&self) -> Vec<(&str, &str, &str)> {
-        self.routes.iter().map(|r| (r.method.as_str(), r.path.as_str(), r.name.as_str())).collect()
+        let mut all: Vec<(&str, &str, &str)> = self.by_method
+            .values()
+            .flatten()
+            .map(|r| (r.method.as_str(), r.path.as_str(), r.name.as_str()))
+            .collect();
+        // Stable ordering for display.
+        all.sort_by_key(|(_, _, name)| *name);
+        all
     }
 
     pub fn match_route(&self, method: &str, path: &str) -> Option<RouteMatch> {
-        self.routes.iter().find_map(|route| {
-            if route.method != method {
-                return None;
+        let candidates = self.by_method.get(method)?;
+
+        // Fast path: exact match for static routes.
+        for route in candidates {
+            if route.is_static {
+                if route.path == path {
+                    return Some(RouteMatch {
+                        route_name: route.name.clone(),
+                        params: BTreeMap::new(),
+                    });
+                }
+                continue;
             }
 
-            match_path(&route.path, path).map(|params| RouteMatch {
-                route: route.clone(),
-                params,
-            })
-        })
-    }
-}
+            // Parameterised route — split actual path segments and compare.
+            let actual_segments = split_segments(path);
+            if actual_segments.len() != route.segments.len() {
+                continue;
+            }
 
-fn match_path(pattern: &str, actual: &str) -> Option<BTreeMap<String, String>> {
-    let pattern_segments = split_segments(pattern);
-    let actual_segments = split_segments(actual);
+            let mut params = BTreeMap::new();
+            let mut matched = true;
 
-    if pattern_segments.len() != actual_segments.len() {
-        return None;
-    }
+            for (pseg, aseg) in route.segments.iter().zip(actual_segments.iter()) {
+                if let Some(param_name) = extract_param_name(pseg) {
+                    params.insert(param_name.to_string(), (*aseg).to_string());
+                } else if pseg != aseg {
+                    matched = false;
+                    break;
+                }
+            }
 
-    let mut params = BTreeMap::new();
-
-    for (pattern_segment, actual_segment) in pattern_segments.iter().zip(actual_segments.iter()) {
-        if let Some(param_name) = extract_param_name(pattern_segment) {
-            params.insert(param_name.to_string(), (*actual_segment).to_string());
-            continue;
+            if matched {
+                return Some(RouteMatch {
+                    route_name: route.name.clone(),
+                    params,
+                });
+            }
         }
 
-        if pattern_segment != actual_segment {
-            return None;
-        }
+        None
     }
-
-    Some(params)
 }
 
 fn split_segments(path: &str) -> Vec<&str> {
@@ -88,6 +133,18 @@ fn split_segments(path: &str) -> Vec<&str> {
     path.trim_matches('/')
         .split('/')
         .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn split_segments_owned(path: &str) -> Vec<String> {
+    if path == "/" {
+        return Vec::new();
+    }
+
+    path.trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(ToString::to_string)
         .collect()
 }
 
