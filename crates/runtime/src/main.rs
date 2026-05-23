@@ -3,7 +3,6 @@ mod embed;
 mod route;
 mod worker;
 
-use anyhow::anyhow;
 use arc_swap::ArcSwap;
 use axum::{
     body::{to_bytes, Body},
@@ -14,16 +13,29 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use config::{LogFormat, RuntimeConfig};
+use config::{CompressionConfig, LogFormat, RuntimeConfig};
 use fium_transport::{CookieMap, HeaderMap, SetCookie, WorkerRequest, PROTOCOL_VERSION};
 use route::RouteTable;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 use tokio::time::Duration;
-use tower_http::compression::{CompressionLayer, predicate::SizeAbove};
+use tower_http::compression::{CompressionLayer, CompressionLevel, predicate::SizeAbove};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use worker::WorkerPool;
+use worker::{RuntimeWorkerError, WorkerPool};
+
+const REQUEST_DURATION_BUCKETS: [f64; 13] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
 
 #[derive(Parser)]
 #[command(name = "fium", about = "Deno for PHP — a fast runtime for PHP applications")]
@@ -92,6 +104,66 @@ struct AppState {
     pool: WorkerPool,
     config: Arc<RuntimeConfig>,
     start_time: Instant,
+    request_latency: Arc<RequestDurationHistogram>,
+}
+
+#[derive(Debug, Default)]
+struct RequestDurationHistogram {
+    buckets: Box<[AtomicU64]>,
+    sum_micros: AtomicU64,
+    count: AtomicU64,
+}
+
+impl RequestDurationHistogram {
+    fn new() -> Self {
+        Self {
+            buckets: (0..=REQUEST_DURATION_BUCKETS.len())
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            sum_micros: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, elapsed: Duration) {
+        let elapsed_secs = elapsed.as_secs_f64();
+        let bucket_index = REQUEST_DURATION_BUCKETS
+            .iter()
+            .position(|bound| elapsed_secs <= *bound)
+            .unwrap_or(REQUEST_DURATION_BUCKETS.len());
+        let elapsed_micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
+
+        self.buckets[bucket_index].fetch_add(1, Ordering::Relaxed);
+        self.sum_micros.fetch_add(elapsed_micros, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn render_prometheus(&self) -> String {
+        let mut body = String::from(
+            "# HELP fium_request_duration_seconds Request latency histogram.\n\
+             # TYPE fium_request_duration_seconds histogram\n",
+        );
+        let mut cumulative = 0u64;
+
+        for (index, count) in self.buckets.iter().enumerate() {
+            cumulative += count.load(Ordering::Relaxed);
+            let bound = REQUEST_DURATION_BUCKETS
+                .get(index)
+                .map(|bound| bound.to_string())
+                .unwrap_or_else(|| "+Inf".to_string());
+            body.push_str(&format!(
+                "fium_request_duration_seconds_bucket{{le=\"{bound}\"}} {cumulative}\n"
+            ));
+        }
+
+        let count = self.count.load(Ordering::Relaxed);
+        let sum_seconds = self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        body.push_str(&format!("fium_request_duration_seconds_sum {sum_seconds}\n"));
+        body.push_str(&format!("fium_request_duration_seconds_count {count}\n"));
+
+        body
+    }
 }
 
 #[tokio::main]
@@ -202,10 +274,11 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
         cfg.workers,
         cfg.max_requests,
         cfg.worker_timeout_ms,
+        cfg.tuning.worker_boot_timeout_ms,
     );
 
     let routes = pool.boot().await
-        .map_err(|error| anyhow!(error))?;
+        .map_err(anyhow::Error::from)?;
 
     print_boot_banner(&cfg, &routes);
 
@@ -216,6 +289,7 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
         pool,
         config: config.clone(),
         start_time: Instant::now(),
+        request_latency: Arc::new(RequestDurationHistogram::new()),
     };
 
     let app = build_router(state, &config);
@@ -251,36 +325,56 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
         let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await?;
         let handle = axum_server::Handle::new();
         let handle_for_signal = handle.clone();
+        let shutdown_config = config.clone();
         tokio::spawn(async move {
             shutdown_signal().await;
-            handle_for_signal.graceful_shutdown(Some(Duration::from_secs(5)));
+            handle_for_signal.graceful_shutdown(Some(Duration::from_secs(
+                shutdown_config.tuning.shutdown_timeout_secs,
+            )));
         });
 
-        let tcp = std::net::TcpListener::bind(address)?;
-        let _ = tcp.set_nonblocking(true);
-
-        axum_server::from_tcp_rustls(tcp, rustls_config)
-            .handle(handle)
-            .serve(app)
-            .await?;
+        let tcp = bind_tcp_listener(address, config.tuning.max_connections, config.tuning.reuse_addr)?;
+        let mut server = axum_server::from_tcp_rustls(tcp, rustls_config).handle(handle);
+        {
+            let http = server.http_builder();
+            http.http1().keep_alive(config.tuning.keep_alive_timeout_secs > 0);
+            if config.tuning.keep_alive_timeout_secs > 0 {
+                let keep_alive = Duration::from_secs(config.tuning.keep_alive_timeout_secs);
+                http.http2().keep_alive_interval(Some(keep_alive));
+                http.http2().keep_alive_timeout(keep_alive);
+            } else {
+                http.http2().keep_alive_interval(None);
+            }
+        }
+        server.serve(app).await?;
     } else {
         let scheme = "http";
         info!(%address, %scheme, "starting runtime");
 
-        let tcp = std::net::TcpListener::bind(address)?;
-        let _ = tcp.set_nonblocking(true);
-
         let handle = axum_server::Handle::new();
         let handle_for_signal = handle.clone();
+        let shutdown_config = config.clone();
         tokio::spawn(async move {
             shutdown_signal().await;
-            handle_for_signal.graceful_shutdown(Some(Duration::from_secs(5)));
+            handle_for_signal.graceful_shutdown(Some(Duration::from_secs(
+                shutdown_config.tuning.shutdown_timeout_secs,
+            )));
         });
 
-        axum_server::from_tcp(tcp)
-            .handle(handle)
-            .serve(app)
-            .await?;
+        let tcp = bind_tcp_listener(address, config.tuning.max_connections, config.tuning.reuse_addr)?;
+        let mut server = axum_server::from_tcp(tcp).handle(handle);
+        {
+            let http = server.http_builder();
+            http.http1().keep_alive(config.tuning.keep_alive_timeout_secs > 0);
+            if config.tuning.keep_alive_timeout_secs > 0 {
+                let keep_alive = Duration::from_secs(config.tuning.keep_alive_timeout_secs);
+                http.http2().keep_alive_interval(Some(keep_alive));
+                http.http2().keep_alive_timeout(keep_alive);
+            } else {
+                http.http2().keep_alive_interval(None);
+            }
+        }
+        server.serve(app).await?;
     }
 
     Ok(())
@@ -297,25 +391,28 @@ async fn health(
         .unwrap_or("");
 
     if accept.contains("application/json") {
-        let workers = state.pool.workers();
-        let total_requests: u64 = workers.iter().map(|w| w.requests_handled()).sum();
-        let total_restarts: u64 = workers.iter().map(|w| w.restarts()).sum();
-        let total_errors: u64 = workers.iter().map(|w| w.errors()).sum();
-        let total_pending: usize = workers.iter().map(|w| w.pending_count()).sum();
-        let uptime = state.start_time.elapsed().as_secs();
+        let snapshot = health_snapshot(&state).await;
 
         let json = serde_json::json!({
-            "status": "ok",
-            "uptime_seconds": uptime,
-            "workers": workers.len(),
-            "requests_total": total_requests,
-            "restarts_total": total_restarts,
-            "errors_total": total_errors,
-            "pending_requests": total_pending,
+            "status": if snapshot.ready { "ok" } else { "degraded" },
+            "ready": snapshot.ready,
+            "uptime_seconds": snapshot.uptime_seconds,
+            "workers": snapshot.workers,
+            "live_workers": snapshot.live_workers,
+            "route_count": snapshot.route_count,
+            "requests_total": snapshot.requests_total,
+            "restarts_total": snapshot.restarts_total,
+            "errors_total": snapshot.errors_total,
+            "pending_requests": snapshot.pending_requests,
+            "memory_rss_bytes": snapshot.memory_rss_bytes,
         });
 
         (
-            StatusCode::OK,
+            if snapshot.ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             json.to_string(),
         ).into_response()
@@ -331,8 +428,9 @@ async fn metrics(State(state): State<AppState>) -> Response {
     let total_errors: u64 = workers.iter().map(|w| w.errors()).sum();
     let total_pending: usize = workers.iter().map(|w| w.pending_count()).sum();
     let uptime = state.start_time.elapsed().as_secs();
+    let memory_rss_bytes = memory_rss_bytes();
 
-    let body = format!(
+    let mut body = format!(
         "# HELP fium_requests_total Total number of requests handled.\n\
          # TYPE fium_requests_total counter\n\
          fium_requests_total {total_requests}\n\
@@ -353,12 +451,77 @@ async fn metrics(State(state): State<AppState>) -> Response {
          fium_uptime_seconds {uptime}\n",
         workers = workers.len(),
     );
+    body.push_str(&state.request_latency.render_prometheus());
+    body.push_str(&format!(
+        "# HELP fium_memory_rss_bytes Resident set size in bytes.\n\
+         # TYPE fium_memory_rss_bytes gauge\n\
+         fium_memory_rss_bytes {memory_rss_bytes}\n"
+    ));
 
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
     ).into_response()
+}
+
+async fn healthz() -> Response {
+    (StatusCode::OK, "ok").into_response()
+}
+
+async fn readyz(State(state): State<AppState>) -> Response {
+    let snapshot = health_snapshot(&state).await;
+    if snapshot.ready {
+        (StatusCode::OK, "ready").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response()
+    }
+}
+
+struct HealthSnapshot {
+    workers: usize,
+    live_workers: usize,
+    route_count: usize,
+    requests_total: u64,
+    restarts_total: u64,
+    errors_total: u64,
+    pending_requests: usize,
+    uptime_seconds: u64,
+    memory_rss_bytes: u64,
+    ready: bool,
+}
+
+async fn health_snapshot(state: &AppState) -> HealthSnapshot {
+    let workers = state.pool.workers().to_vec();
+    let worker_count = workers.len();
+    let requests_total: u64 = workers.iter().map(|w| w.requests_handled()).sum();
+    let restarts_total: u64 = workers.iter().map(|w| w.restarts()).sum();
+    let errors_total: u64 = workers.iter().map(|w| w.errors()).sum();
+    let pending_requests: usize = workers.iter().map(|w| w.pending_count()).sum();
+    let route_count = {
+        let routes = state.routes.load();
+        routes.list().len()
+    };
+
+    let mut live_workers = 0usize;
+    for worker in &workers {
+        if worker.is_alive().await {
+            live_workers += 1;
+        }
+    }
+
+    HealthSnapshot {
+        workers: worker_count,
+        live_workers,
+        route_count,
+        requests_total,
+        restarts_total,
+        errors_total,
+        pending_requests,
+        uptime_seconds: state.start_time.elapsed().as_secs(),
+        memory_rss_bytes: memory_rss_bytes(),
+        ready: route_count > 0 && live_workers > 0,
+    }
 }
 
 fn print_boot_banner(cfg: &RuntimeConfig, routes: &RouteTable) {
@@ -388,20 +551,24 @@ fn print_boot_banner(cfg: &RuntimeConfig, routes: &RouteTable) {
 fn build_router(state: AppState, config: &RuntimeConfig) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
     let mut app = Router::new()
         .route("/health", get(health))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/_fium/metrics", get(metrics))
         .fallback(dispatch)
         .with_state(state);
 
     // Cache-Control for static assets — 1 hour by default, immutable for hashed assets works too.
-    let cache_header = axum::http::HeaderValue::from_static("public, max-age=3600");
+    let cache_header = HeaderValue::from_str(&format!(
+        "public, max-age={}",
+        config.compression.static_cache_max_age_secs
+    ))
+    .expect("static cache header should always be valid");
 
     if config.static_enabled {
         if let Some(ref static_dir) = config.static_dir {
             if static_dir.is_dir() {
                 info!(dir = %static_dir.display(), "serving static files");
-                let serve_dir = tower_http::services::ServeDir::new(static_dir)
-                    .precompressed_gzip()
-                    .precompressed_br();
+                let serve_dir = build_static_serve_dir(static_dir, &config.compression);
                 app = Router::new()
                     .nest_service(
                         "/",
@@ -417,11 +584,15 @@ fn build_router(state: AppState, config: &RuntimeConfig) -> axum::extract::conne
 
     app.layer(
         CompressionLayer::new()
+            .quality(CompressionLevel::Precise(config.compression.level))
+            .gzip(config.compression.gzip_enabled())
+            .br(config.compression.br_enabled())
             .compress_when(SizeAbove::new(256))
     )
         .into_make_service_with_connect_info::<SocketAddr>()
 }
 
+#[tracing::instrument(skip_all, fields(method, path, request_id))]
 async fn dispatch(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -429,6 +600,9 @@ async fn dispatch(
 ) -> Response {
     let path = request.uri().path().to_string();
     let method = request.method().to_string();
+    let span = tracing::Span::current();
+    span.record("method", tracing::field::display(&method));
+    span.record("path", tracing::field::display(&path));
 
     let route_match = {
         let routes = state.routes.load();
@@ -442,6 +616,7 @@ async fn dispatch(
 
     let request_id = format!("req_{}", Uuid::new_v4().simple());
     let start = Instant::now();
+    span.record("request_id", tracing::field::display(&request_id));
     let query_string = request.uri().query().unwrap_or_default().to_string();
     let host = request
         .headers()
@@ -522,6 +697,7 @@ async fn dispatch(
     match state.pool.handle(worker_request).await {
         Ok(worker_response) => {
             let elapsed = start.elapsed();
+            state.request_latency.record(elapsed);
             info!(
                 method = %log_method,
                 path = %log_path,
@@ -558,10 +734,11 @@ async fn dispatch(
 
             response
         }
-        Err(error_message) => {
+        Err(error) => {
             let elapsed = start.elapsed();
+            state.request_latency.record(elapsed);
             error!(
-                %error_message,
+                %error,
                 method = %log_method,
                 path = %log_path,
                 route = %route_name,
@@ -569,7 +746,7 @@ async fn dispatch(
                 %request_id,
                 "worker dispatch failed"
             );
-            let status = if error_message.starts_with("worker request timed out") {
+            let status = if matches!(error, RuntimeWorkerError::Timeout { .. }) {
                 StatusCode::GATEWAY_TIMEOUT
             } else {
                 StatusCode::BAD_GATEWAY
@@ -647,10 +824,11 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
         cfg.workers,
         cfg.max_requests,
         cfg.worker_timeout_ms,
+        cfg.tuning.worker_boot_timeout_ms,
     );
 
     let routes = pool.boot().await
-        .map_err(|error| anyhow!(error))?;
+        .map_err(anyhow::Error::from)?;
 
     print_boot_banner(&cfg, &routes);
     eprintln!("  \x1b[2m\u{2192}\x1b[0m  Mode:    \x1b[33mdev\x1b[0m (watching for changes)");
@@ -664,6 +842,7 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
         pool: pool.clone(),
         config: config.clone(),
         start_time: Instant::now(),
+        request_latency: Arc::new(RequestDurationHistogram::new()),
     };
 
     let app = build_router(state, &config);
@@ -711,20 +890,31 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
     });
 
     let address: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
-    let tcp = std::net::TcpListener::bind(address)?;
-    let _ = tcp.set_nonblocking(true);
+    let tcp = bind_tcp_listener(address, config.tuning.max_connections, config.tuning.reuse_addr)?;
 
     let handle = axum_server::Handle::new();
     let handle_for_signal = handle.clone();
+    let shutdown_config = config.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
-        handle_for_signal.graceful_shutdown(Some(Duration::from_secs(5)));
+        handle_for_signal.graceful_shutdown(Some(Duration::from_secs(
+            shutdown_config.tuning.shutdown_timeout_secs,
+        )));
     });
 
-    axum_server::from_tcp(tcp)
-        .handle(handle)
-        .serve(app)
-        .await?;
+    let mut server = axum_server::from_tcp(tcp).handle(handle);
+    {
+        let http = server.http_builder();
+        http.http1().keep_alive(config.tuning.keep_alive_timeout_secs > 0);
+        if config.tuning.keep_alive_timeout_secs > 0 {
+            let keep_alive = Duration::from_secs(config.tuning.keep_alive_timeout_secs);
+            http.http2().keep_alive_interval(Some(keep_alive));
+            http.http2().keep_alive_timeout(keep_alive);
+        } else {
+            http.http2().keep_alive_interval(None);
+        }
+    }
+    server.serve(app).await?;
 
     Ok(())
 }
@@ -732,6 +922,39 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     info!("shutdown signal received");
+}
+
+fn bind_tcp_listener(
+    address: SocketAddr,
+    max_connections: u32,
+    reuse_addr: bool,
+) -> anyhow::Result<std::net::TcpListener> {
+    let domain = if address.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(reuse_addr)?;
+    socket.bind(&address.into())?;
+    socket.listen(max_connections.min(i32::MAX as u32) as i32)?;
+    socket.set_nonblocking(true)?;
+
+    Ok(socket.into())
+}
+
+fn build_static_serve_dir(
+    static_dir: &PathBuf,
+    compression: &CompressionConfig,
+) -> tower_http::services::ServeDir {
+    let mut serve_dir = tower_http::services::ServeDir::new(static_dir);
+    if compression.gzip_enabled() {
+        serve_dir = serve_dir.precompressed_gzip();
+    }
+    if compression.br_enabled() {
+        serve_dir = serve_dir.precompressed_br();
+    }
+    serve_dir
 }
 
 fn normalize_headers(headers: &axum::http::HeaderMap) -> HeaderMap {
@@ -808,4 +1031,98 @@ fn encode_cookie_value(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn memory_rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_memory_rss_bytes().unwrap_or(0);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_memory_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+
+    parse_statm_rss_bytes(&statm, page_size as u64)
+}
+
+fn parse_statm_rss_bytes(statm: &str, page_size: u64) -> Option<u64> {
+    let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    resident_pages.checked_mul(page_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bind_tcp_listener, encode_cookie_value, format_set_cookie, parse_statm_rss_bytes,
+        RequestDurationHistogram,
+    };
+    use fium_transport::SetCookie;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::time::Duration;
+
+    #[test]
+    fn encode_cookie_value_special_chars() {
+        assert_eq!(encode_cookie_value("hello world"), "hello%20world");
+        assert_eq!(encode_cookie_value("a;b"), "a%3Bb");
+    }
+
+    #[test]
+    fn format_set_cookie_includes_all_flags() {
+        let cookie = SetCookie {
+            name: "session".into(),
+            value: "abc".into(),
+            path: Some("/".into()),
+            http_only: true,
+            secure: true,
+            same_site: Some("Lax".into()),
+            max_age: Some(3600),
+        };
+
+        let header = format_set_cookie(&cookie);
+        assert!(header.contains("HttpOnly"));
+        assert!(header.contains("Secure"));
+        assert!(header.contains("SameSite=Lax"));
+        assert!(header.contains("Max-Age=3600"));
+    }
+
+    #[test]
+    fn request_duration_histogram_renders_cumulative_buckets() {
+        let histogram = RequestDurationHistogram::new();
+        histogram.record(Duration::from_millis(3));
+        histogram.record(Duration::from_millis(7));
+
+        let rendered = histogram.render_prometheus();
+        assert!(rendered.contains("fium_request_duration_seconds_bucket{le=\"0.005\"} 1"));
+        assert!(rendered.contains("fium_request_duration_seconds_bucket{le=\"0.01\"} 2"));
+        assert!(rendered.contains("fium_request_duration_seconds_count 2"));
+    }
+
+    #[test]
+    fn parse_statm_rss_bytes_parses_resident_pages() {
+        assert_eq!(parse_statm_rss_bytes("100 25 0 0 0 0 0", 4096), Some(102_400));
+        assert_eq!(parse_statm_rss_bytes("invalid", 4096), None);
+    }
+
+    #[test]
+    fn bind_tcp_listener_respects_requested_address() {
+        let listener = bind_tcp_listener(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            128,
+            true,
+        )
+        .expect("listener should bind");
+
+        assert!(listener.local_addr().is_ok());
+    }
 }

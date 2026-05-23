@@ -1,5 +1,6 @@
 use fium_transport::BootRoute;
 use std::collections::{BTreeMap, HashMap};
+use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
@@ -22,10 +23,16 @@ pub struct RouteMatch {
     pub params: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Error)]
+pub enum RouteError {
+    #[error("worker boot message contained no routes")]
+    EmptyBootRoutes,
+}
+
 impl RouteTable {
-    pub fn from_boot_routes(boot_routes: Vec<BootRoute>) -> Result<Self, String> {
+    pub fn from_boot_routes(boot_routes: Vec<BootRoute>) -> Result<Self, RouteError> {
         if boot_routes.is_empty() {
-            return Err("worker boot message contained no routes".to_string());
+            return Err(RouteError::EmptyBootRoutes);
         }
 
         let mut by_method: HashMap<String, Vec<RouteEntry>> = HashMap::new();
@@ -153,4 +160,75 @@ fn extract_param_name(segment: &str) -> Option<&str> {
         .strip_prefix('{')
         .and_then(|value| value.strip_suffix('}'))
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fium_transport::BootRoute;
+
+    fn table(routes: &[(&str, &str, &str)]) -> RouteTable {
+        let boot_routes = routes
+            .iter()
+            .map(|(method, path, name)| BootRoute {
+                method: (*method).to_string(),
+                path: (*path).to_string(),
+                name: (*name).to_string(),
+                middleware: Vec::new(),
+            })
+            .collect();
+
+        RouteTable::from_boot_routes(boot_routes).expect("route table should build")
+    }
+
+    #[test]
+    fn static_route_match() {
+        let t = table(&[("GET", "/health", "health")]);
+        let matched = t.match_route("GET", "/health").expect("route should match");
+        assert_eq!(matched.route_name, "health");
+    }
+
+    #[test]
+    fn static_route_404() {
+        let t = table(&[("GET", "/health", "health")]);
+        assert!(t.match_route("GET", "/missing").is_none());
+    }
+
+    #[test]
+    fn method_mismatch() {
+        let t = table(&[("GET", "/health", "health")]);
+        assert!(t.match_route("POST", "/health").is_none());
+    }
+
+    #[test]
+    fn parameterized_route() {
+        let t = table(&[("GET", "/users/{id}", "users_show")]);
+        let matched = t
+            .match_route("GET", "/users/42")
+            .expect("parameterized route should match");
+
+        assert_eq!(matched.route_name, "users_show");
+        assert_eq!(matched.params.get("id").map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn static_before_parameterized() {
+        let t = table(&[
+            ("GET", "/users/me", "users_me"),
+            ("GET", "/users/{id}", "users_show"),
+        ]);
+
+        assert_eq!(
+            t.match_route("GET", "/users/me")
+                .expect("static route should win")
+                .route_name,
+            "users_me"
+        );
+        assert_eq!(
+            t.match_route("GET", "/users/42")
+                .expect("parameterized route should still match")
+                .route_name,
+            "users_show"
+        );
+    }
 }

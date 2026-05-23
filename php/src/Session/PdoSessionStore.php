@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Fium\Session;
 
-final class PdoSessionStore implements SessionStore
+final class PdoSessionStore extends AbstractSessionStore
 {
     private \PDO $pdo;
 
@@ -69,24 +69,5 @@ final class PdoSessionStore implements SessionStore
             . 'updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP'
             . ')'
         );
-    }
-
-    private function generateId(): string
-    {
-        return bin2hex(random_bytes(20));
-    }
-
-    private function normalizeId(?string $sessionId): ?string
-    {
-        if ($sessionId === null || $sessionId === '') {
-            return null;
-        }
-
-        $len = strlen($sessionId);
-        if ($len < 16 || $len > 64 || !ctype_xdigit($sessionId)) {
-            return null;
-        }
-
-        return $sessionId;
     }
 }

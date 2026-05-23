@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Fium\Session;
 
-final class FileSessionStore implements SessionStore
+final class FileSessionStore extends AbstractSessionStore
 {
     public function __construct(private string $directory)
     {
@@ -51,24 +51,5 @@ final class FileSessionStore implements SessionStore
     private function pathFor(string $sessionId): string
     {
         return rtrim($this->directory, '/') . '/' . $sessionId . '.json';
-    }
-
-    private function generateId(): string
-    {
-        return bin2hex(random_bytes(20));
-    }
-
-    private function normalizeId(?string $sessionId): ?string
-    {
-        if ($sessionId === null || $sessionId === '') {
-            return null;
-        }
-
-        $len = strlen($sessionId);
-        if ($len < 16 || $len > 64 || !ctype_xdigit($sessionId)) {
-            return null;
-        }
-
-        return $sessionId;
     }
 }

@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace Fium\Runtime;
 
 use Fium\Auth\Authenticator;
-use Fium\Auth\ApiTokenService;
 use Fium\Auth\User;
+use Fium\Contracts\TokenService;
 use Fium\Session\Session;
 use Fium\Validator;
 
@@ -227,11 +227,11 @@ final class Request
         return $authenticator instanceof Authenticator ? $authenticator : null;
     }
 
-    public function tokenService(): ?ApiTokenService
+    public function tokenService(): ?TokenService
     {
         $tokenService = $this->attribute('token_service');
 
-        return $tokenService instanceof ApiTokenService ? $tokenService : null;
+        return $tokenService instanceof TokenService ? $tokenService : null;
     }
 
     /**

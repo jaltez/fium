@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Fium\Auth;
 
-final class ApiTokenService
+use Fium\Contracts\TokenService;
+
+final class ApiTokenService implements TokenService
 {
     public function __construct(
         private Authenticator $authenticator,

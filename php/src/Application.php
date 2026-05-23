@@ -8,6 +8,7 @@ use Fium\Auth\Authenticator;
 use Fium\Auth\ApiTokenService;
 use Fium\Contracts\Handler;
 use Fium\Contracts\Middleware;
+use Fium\Contracts\TokenService;
 use Fium\Middleware\AddPoweredByHeader;
 use Fium\Middleware\AuthenticateBearer;
 use Fium\Middleware\AuthenticateSession;
@@ -25,10 +26,10 @@ final class Application
 {
     private static ?self $instance = null;
 
-    /** @var array<string, callable> handler by route name (closures or class-string) */
+    /** @var array<string, callable|string> handler by route name */
     private array $handlers;
 
-    /** @var array<string, array{method: string, path: string, name: string, middleware: list<string>, _chain: callable}> */
+    /** @var array<string, array{method: string, path: string, name: string, middleware: list<string>, _chain?: callable(Request): Response}> */
     private array $routeMap;
 
     /** @var array<string, class-string<Middleware>> */
@@ -39,7 +40,7 @@ final class Application
 
     private string $baseDir;
     private Authenticator $authenticator;
-    private ApiTokenService $tokenService;
+    private TokenService $tokenService;
     private bool $debug;
 
     /** @param array<mixed> $rawRoutes */

@@ -32,10 +32,10 @@ Or with the example app:
 ## Features
 
 **Runtime (Rust)**
-- Worker pool with round-robin dispatch, crash recovery, and max-request recycling
+- Worker pool with least-loaded dispatch, crash recovery, and max-request recycling
 - TLS/HTTPS via `--tls-cert`/`--tls-key` or `--tls-self-signed` for development
 - Static file serving from a configurable directory
-- Gzip, Brotli, and Zstd response compression
+- Gzip and Brotli response compression
 - Trusted proxy support (`FIUM_TRUSTED_PROXIES`)
 - Configurable request timeouts and body size limits
 - Structured logging with JSON format option
@@ -52,10 +52,8 @@ Or with the example app:
 - Middleware pipeline: session, auth, CSRF, CORS, rate limiting, security headers, role guards, bearer tokens
 - Session storage: file-backed or PDO-backed
 - User storage: file-backed or PDO-backed
-- Cache abstraction: file-backed or PDO-backed
 - Config class with `.env` file loading
 - Input validation with common rules
-- Logger (writes to stderr, captured by runtime)
 - JSON, HTML, text, redirect, and empty response types
 
 ## Configuration
@@ -68,8 +66,20 @@ host = "127.0.0.1"
 port = 3000
 workers = 0           # 0 = auto (CPU count)
 max_requests = 0      # 0 = no limit (worker recycling)
-worker_timeout_ms = 750
+worker_timeout_ms = 5000
 body_max_size = "1mb"
+
+[tuning]
+shutdown_timeout_secs = 30
+keep_alive_timeout_secs = 60
+max_connections = 1024
+worker_boot_timeout_ms = 10000
+reuse_addr = true
+
+[compression]
+algorithms = ["gzip", "br"]
+level = 4
+static_cache_max_age_secs = 3600
 
 [tls]
 cert = "certs/server.crt"
@@ -122,7 +132,7 @@ Built-in middleware aliases:
 | Config | `fium.toml` (optional) | `.rr.yaml` (required) | `Caddyfile` |
 | TLS | Built-in | Built-in + ACME | Automatic (Caddy) |
 | Static files | Built-in | Plugin | Built-in |
-| Compression | gzip/br/zstd | gzip (plugin) | gzip |
+| Compression | gzip/br | gzip (plugin) | gzip |
 | Metrics | Prometheus | Prometheus | Prometheus |
 | Worker model | Process pool | Process pool | Threads (C module) |
 | PHP dependency | None | Composer package | PHP extension |

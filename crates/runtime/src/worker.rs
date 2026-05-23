@@ -1,6 +1,8 @@
+use async_trait::async_trait;
 use fium_transport::{BootMessage, WorkerRequest, WorkerResponse, PROTOCOL_VERSION};
+use thiserror::Error;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot, Mutex},
     time::{timeout, Duration},
@@ -10,16 +12,101 @@ use tracing::{info, warn};
 use std::{path::PathBuf, sync::Arc};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::route::RouteTable;
+use crate::route::{RouteError, RouteTable};
 
 /// Maximum frame size accepted from a PHP worker (16 MB).
 const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+
+#[derive(Debug, Error)]
+pub enum RuntimeWorkerError {
+    #[error("worker process disappeared before boot message")]
+    BootProcessMissing,
+    #[error("worker boot timed out while {context} after {ms} ms")]
+    BootTimeout {
+        context: &'static str,
+        ms: u128,
+    },
+    #[error("worker request {request_id} timed out while {stage} after {ms} ms")]
+    Timeout {
+        request_id: String,
+        stage: &'static str,
+        ms: u128,
+    },
+    #[error("failed to {context}: {source}")]
+    Io {
+        context: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to {context}: {source}")]
+    Json {
+        context: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("expected boot message type '{expected}', got '{got}'")]
+    UnexpectedMessageType {
+        expected: &'static str,
+        got: String,
+    },
+    #[error("worker protocol mismatch: expected {expected}, got {got}")]
+    ProtocolVersionMismatch {
+        expected: u32,
+        got: u32,
+    },
+    #[error("worker request id mismatch: expected {expected}, got {got}")]
+    RequestIdMismatch {
+        expected: String,
+        got: String,
+    },
+    #[error("failed to spawn PHP worker using '{php_binary}' and '{worker_entrypoint}': {source}")]
+    Spawn {
+        php_binary: String,
+        worker_entrypoint: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("worker frame too large: {size} bytes (max {max})")]
+    FrameTooLarge {
+        size: u32,
+        max: u32,
+    },
+    #[error("worker frame contained invalid UTF-8: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+    #[error("worker has shut down")]
+    WorkerShutdown,
+    #[error("worker task terminated")]
+    WorkerTaskTerminated,
+    #[error("worker process unavailable")]
+    ProcessUnavailable,
+    #[error("worker {pipe} unavailable")]
+    MissingPipe {
+        pipe: &'static str,
+    },
+    #[error(transparent)]
+    Routes(#[from] RouteError),
+    #[error("all workers failed to boot: {last_error}")]
+    AllWorkersFailedToBoot {
+        last_error: Box<RuntimeWorkerError>,
+    },
+    #[error("{request_error}; additionally failed to replace worker after retry failure: {restart_error}")]
+    RetryReplacement {
+        request_error: Box<RuntimeWorkerError>,
+        restart_error: Box<RuntimeWorkerError>,
+    },
+}
+
+#[async_trait]
+pub trait WorkerTransport {
+    async fn write_frame(&mut self, json: &str) -> Result<(), RuntimeWorkerError>;
+    async fn read_frame(&mut self, max_size: u32) -> Result<String, RuntimeWorkerError>;
+}
 
 // Messages sent from WorkerSupervisor::handle() to the per-worker background task.
 enum WorkerMessage {
     Request {
         request: WorkerRequest,
-        reply: oneshot::Sender<Result<WorkerResponse, String>>,
+        reply: oneshot::Sender<Result<WorkerResponse, RuntimeWorkerError>>,
     },
     Restart {
         reply: oneshot::Sender<()>,
@@ -49,14 +136,27 @@ struct WorkerProcess {
     stdout: BufReader<ChildStdout>,
 }
 
+#[async_trait]
+impl WorkerTransport for WorkerProcess {
+    async fn write_frame(&mut self, json: &str) -> Result<(), RuntimeWorkerError> {
+        WorkerSupervisor::write_frame_io(&mut self.stdin, json).await
+    }
+
+    async fn read_frame(&mut self, max_size: u32) -> Result<String, RuntimeWorkerError> {
+        WorkerSupervisor::read_frame_io(&mut self.stdout, max_size).await
+    }
+}
+
 impl WorkerSupervisor {
     pub fn new(
         worker_entrypoint: impl Into<String>,
         app_file: impl Into<String>,
         request_timeout_ms: u64,
+        boot_timeout_ms: u64,
         max_requests: u64,
     ) -> Self {
         let timeout_ms = if request_timeout_ms > 0 { request_timeout_ms } else { 750 };
+        let boot_timeout_ms = if boot_timeout_ms > 0 { boot_timeout_ms } else { 10_000 };
         let process = Arc::new(Mutex::new(None));
         let (tx, rx) = mpsc::unbounded_channel();
         let pending = Arc::new(AtomicUsize::new(0));
@@ -69,7 +169,7 @@ impl WorkerSupervisor {
             worker_entrypoint: PathBuf::from(worker_entrypoint.into()),
             app_file: PathBuf::from(app_file.into()),
             request_timeout: Duration::from_millis(timeout_ms),
-            boot_timeout: Duration::from_secs(10),
+            boot_timeout: Duration::from_millis(boot_timeout_ms),
             max_requests,
             process: process.clone(),
             tx,
@@ -128,9 +228,28 @@ impl WorkerSupervisor {
         self.errors.load(Ordering::Relaxed)
     }
 
+    pub async fn is_alive(&self) -> bool {
+        let mut process = self.process.lock().await;
+        let Some(worker) = process.as_mut() else {
+            return false;
+        };
+
+        match worker.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                *process = None;
+                false
+            }
+            Err(error) => {
+                warn!(%error, "failed to inspect worker process liveness");
+                false
+            }
+        }
+    }
+
     /// Spawn the PHP worker and read the boot message containing the route manifest.
     /// Returns the RouteTable built from the worker's declared routes.
-    pub async fn boot(&self) -> Result<RouteTable, String> {
+    pub async fn boot(&self) -> Result<RouteTable, RuntimeWorkerError> {
         let mut process = self.process.lock().await;
 
         let worker = self.spawn_worker().await?;
@@ -138,55 +257,33 @@ impl WorkerSupervisor {
 
         let worker = process
             .as_mut()
-            .ok_or_else(|| "worker process disappeared before boot message".to_string())?;
+            .ok_or(RuntimeWorkerError::BootProcessMissing)?;
 
-        let line = timeout(self.boot_timeout, Self::read_frame(&mut worker.stdout, MAX_FRAME_SIZE))
-            .await
-            .map_err(|_| {
-                format!(
-                    "worker boot timed out after {} ms",
-                    self.boot_timeout.as_millis()
-                )
-            })?
-            .map_err(|error| format!("failed to read worker boot message: {error}"))?;
-
-        let boot: BootMessage = serde_json::from_str(&line)
-            .map_err(|error| format!("failed to parse worker boot message: {error}"))?;
-
-        if boot.message_type != "boot" {
-            return Err(format!(
-                "expected boot message type 'boot', got '{}'",
-                boot.message_type
-            ));
-        }
-
-        if boot.protocol_version != PROTOCOL_VERSION {
-            return Err(format!(
-                "worker protocol mismatch: expected {}, got {}",
-                PROTOCOL_VERSION, boot.protocol_version
-            ));
-        }
+        let boot = Self::read_boot_message(worker, self.boot_timeout).await?;
 
         info!(route_count = boot.routes.len(), "worker booted successfully");
 
-        RouteTable::from_boot_routes(boot.routes)
+        Ok(RouteTable::from_boot_routes(boot.routes)?)
     }
 
     /// Queue a request to be processed by this worker. Returns immediately;
     /// the response arrives via the oneshot when the background task finishes.
-    pub async fn handle(&self, request: WorkerRequest) -> Result<WorkerResponse, String> {
+    pub async fn handle(&self, request: WorkerRequest) -> Result<WorkerResponse, RuntimeWorkerError> {
         self.pending.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         if self.tx.send(WorkerMessage::Request { request, reply: reply_tx }).is_err() {
             self.pending.fetch_sub(1, Ordering::Relaxed);
-            return Err("worker has shut down".to_string());
+            return Err(RuntimeWorkerError::WorkerShutdown);
         }
-        let result = reply_rx.await.map_err(|_| "worker task terminated".to_string())?;
+        let result = reply_rx
+            .await
+            .map_err(|_| RuntimeWorkerError::WorkerTaskTerminated)?;
         self.pending.fetch_sub(1, Ordering::Relaxed);
         result
     }
 
     /// Process a single request (called from the background task).
+    #[tracing::instrument(skip_all, fields(request_id = %request.request_id))]
     async fn process_request(
         php_binary: &str,
         worker_entrypoint: &PathBuf,
@@ -199,7 +296,7 @@ impl WorkerSupervisor {
         requests_handled: &Arc<AtomicU64>,
         restarts: &Arc<AtomicU64>,
         errors: &Arc<AtomicU64>,
-    ) -> Result<WorkerResponse, String> {
+    ) -> Result<WorkerResponse, RuntimeWorkerError> {
         let mut slot = process.lock().await;
 
         // Check if worker needs recycling due to max_requests
@@ -254,9 +351,10 @@ impl WorkerSupervisor {
                                 restarts.fetch_add(1, Ordering::Relaxed);
                                 Err(second_error)
                             }
-                            Err(restart_error) => Err(format!(
-                                "{second_error}; additionally failed to replace worker after retry failure: {restart_error}"
-                            )),
+                            Err(restart_error) => Err(RuntimeWorkerError::RetryReplacement {
+                                request_error: Box::new(second_error),
+                                restart_error: Box::new(restart_error),
+                            }),
                         }
                     }
                 }
@@ -265,43 +363,149 @@ impl WorkerSupervisor {
     }
 
     /// Write a length-prefixed JSON frame to a writer.
-    async fn write_frame<T: tokio::io::AsyncWrite + Unpin>(
+    async fn write_frame_io<T: tokio::io::AsyncWrite + Unpin>(
         writer: &mut T,
         json: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeWorkerError> {
         let len = json.len() as u32;
-        writer.write_all(&len.to_be_bytes()).await
-            .map_err(|e| format!("failed to write frame length: {e}"))?;
-        writer.write_all(json.as_bytes()).await
-            .map_err(|e| format!("failed to write frame body: {e}"))?;
-        writer.flush().await
-            .map_err(|e| format!("failed to flush frame: {e}"))
+        writer.write_all(&len.to_be_bytes()).await.map_err(|source| {
+            RuntimeWorkerError::Io {
+                context: "write frame length",
+                source,
+            }
+        })?;
+        writer
+            .write_all(json.as_bytes())
+            .await
+            .map_err(|source| RuntimeWorkerError::Io {
+                context: "write frame body",
+                source,
+            })?;
+        writer.flush().await.map_err(|source| RuntimeWorkerError::Io {
+            context: "flush frame",
+            source,
+        })
     }
 
     /// Read a length-prefixed JSON frame from a buffered reader.
-    async fn read_frame(
+    async fn read_frame_io(
         reader: &mut BufReader<ChildStdout>,
         max_size: u32,
-    ) -> Result<String, String> {
+    ) -> Result<String, RuntimeWorkerError> {
         let mut len_buf = [0u8; 4];
-        reader.read_exact(&mut len_buf).await
-            .map_err(|e| format!("failed to read frame length: {e}"))?;
+        reader
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(|source| RuntimeWorkerError::Io {
+                context: "read frame length",
+                source,
+            })?;
         let len = u32::from_be_bytes(len_buf);
 
         if len > max_size {
-            return Err(format!(
-                "worker frame too large: {len} bytes (max {max_size})"
-            ));
+            return Err(RuntimeWorkerError::FrameTooLarge {
+                size: len,
+                max: max_size,
+            });
         }
 
         let mut body = vec![0u8; len as usize];
-        reader.read_exact(&mut body).await
-            .map_err(|e| format!("failed to read frame body: {e}"))?;
+        reader.read_exact(&mut body).await.map_err(|source| {
+            RuntimeWorkerError::Io {
+                context: "read frame body",
+                source,
+            }
+        })?;
 
-        String::from_utf8(body)
-            .map_err(|e| format!("worker frame contained invalid UTF-8: {e}"))
+        String::from_utf8(body).map_err(RuntimeWorkerError::from)
     }
 
+    async fn read_boot_message<T: WorkerTransport + ?Sized>(
+        transport: &mut T,
+        boot_timeout: Duration,
+    ) -> Result<BootMessage, RuntimeWorkerError> {
+        let frame = timeout(boot_timeout, transport.read_frame(MAX_FRAME_SIZE))
+            .await
+            .map_err(|_| RuntimeWorkerError::BootTimeout {
+                context: "waiting for boot message",
+                ms: boot_timeout.as_millis(),
+            })??;
+
+        let boot: BootMessage = serde_json::from_str(&frame).map_err(|source| {
+            RuntimeWorkerError::Json {
+                context: "parse worker boot message",
+                source,
+            }
+        })?;
+
+        if boot.message_type != "boot" {
+            return Err(RuntimeWorkerError::UnexpectedMessageType {
+                expected: "boot",
+                got: boot.message_type,
+            });
+        }
+
+        if boot.protocol_version != PROTOCOL_VERSION {
+            return Err(RuntimeWorkerError::ProtocolVersionMismatch {
+                expected: PROTOCOL_VERSION,
+                got: boot.protocol_version,
+            });
+        }
+
+        Ok(boot)
+    }
+
+    async fn dispatch_transport<T: WorkerTransport + ?Sized>(
+        transport: &mut T,
+        request: &WorkerRequest,
+        request_timeout: Duration,
+    ) -> Result<WorkerResponse, RuntimeWorkerError> {
+        let encoded = serde_json::to_string(request)
+            .map_err(|source| RuntimeWorkerError::Json {
+                context: "encode worker request",
+                source,
+            })?;
+
+        timeout(request_timeout, transport.write_frame(&encoded))
+            .await
+            .map_err(|_| RuntimeWorkerError::Timeout {
+                request_id: request.request_id.clone(),
+                stage: "writing request",
+                ms: request_timeout.as_millis(),
+            })??;
+
+        let frame = timeout(request_timeout, transport.read_frame(MAX_FRAME_SIZE))
+            .await
+            .map_err(|_| RuntimeWorkerError::Timeout {
+                request_id: request.request_id.clone(),
+                stage: "reading response",
+                ms: request_timeout.as_millis(),
+            })??;
+
+        let response: WorkerResponse = serde_json::from_str(&frame)
+            .map_err(|source| RuntimeWorkerError::Json {
+                context: "decode worker response",
+                source,
+            })?;
+
+        if response.protocol_version != PROTOCOL_VERSION {
+            return Err(RuntimeWorkerError::ProtocolVersionMismatch {
+                expected: PROTOCOL_VERSION,
+                got: response.protocol_version,
+            });
+        }
+
+        if response.request_id != request.request_id {
+            return Err(RuntimeWorkerError::RequestIdMismatch {
+                expected: request.request_id.clone(),
+                got: response.request_id,
+            });
+        }
+
+        Ok(response)
+    }
+
+    #[tracing::instrument(skip_all, fields(request_id = %request.request_id))]
     async fn dispatch_once(
         _php_binary: &str,
         _worker_entrypoint: &PathBuf,
@@ -310,50 +514,9 @@ impl WorkerSupervisor {
         _boot_timeout: Duration,
         slot: &mut Option<WorkerProcess>,
         request: &WorkerRequest,
-    ) -> Result<WorkerResponse, String> {
+    ) -> Result<WorkerResponse, RuntimeWorkerError> {
         let process = Self::ensure_started(slot).await?;
-
-        let encoded = serde_json::to_string(request)
-            .map_err(|error| format!("failed to encode worker request: {error}"))?;
-
-        timeout(request_timeout, Self::write_frame(&mut process.stdin, &encoded))
-            .await
-            .map_err(|_| {
-                format!(
-                    "worker request timed out while writing request {} after {} ms",
-                    request.request_id,
-                    request_timeout.as_millis()
-                )
-            })??;
-
-        let frame = timeout(request_timeout, Self::read_frame(&mut process.stdout, MAX_FRAME_SIZE))
-            .await
-            .map_err(|_| {
-                format!(
-                    "worker request timed out while reading response {} after {} ms",
-                    request.request_id,
-                    request_timeout.as_millis()
-                )
-            })??;
-
-        let response: WorkerResponse = serde_json::from_str(&frame)
-            .map_err(|error| format!("failed to decode worker response: {error}"))?;
-
-        if response.protocol_version != PROTOCOL_VERSION {
-            return Err(format!(
-                "worker protocol mismatch: expected {}, got {}",
-                PROTOCOL_VERSION, response.protocol_version
-            ));
-        }
-
-        if response.request_id != request.request_id {
-            return Err(format!(
-                "worker request id mismatch: expected {}, got {}",
-                request.request_id, response.request_id
-            ));
-        }
-
-        Ok(response)
+        Self::dispatch_transport(process, request, request_timeout).await
     }
 
     async fn kill_and_restart(
@@ -362,16 +525,13 @@ impl WorkerSupervisor {
         app_file: &PathBuf,
         boot_timeout: Duration,
         slot: &mut Option<WorkerProcess>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeWorkerError> {
         Self::kill_process(slot).await;
         *slot = None;
 
         let mut worker = Self::spawn_worker_cfg(php_binary, worker_entrypoint, app_file).await?;
         // Consume the boot message that every new PHP worker emits on startup.
-        timeout(boot_timeout, Self::read_frame(&mut worker.stdout, MAX_FRAME_SIZE))
-            .await
-            .map_err(|_| "timed out waiting for boot message from restarted worker".to_string())?
-            .map_err(|error| format!("failed to read boot message from restarted worker: {error}"))?;
+        let _ = Self::read_boot_message(&mut worker, boot_timeout).await?;
         *slot = Some(worker);
         Ok(())
     }
@@ -396,15 +556,15 @@ impl WorkerSupervisor {
 
     async fn ensure_started<'a>(
         slot: &'a mut Option<WorkerProcess>,
-    ) -> Result<&'a mut WorkerProcess, String> {
+    ) -> Result<&'a mut WorkerProcess, RuntimeWorkerError> {
         // The retry logic in process_request handles worker failures.
         // If the worker died between writes, we'll get an I/O error and restart.
         // No need for a try_wait() syscall on every request.
         slot.as_mut()
-            .ok_or_else(|| "worker process unavailable".to_string())
+            .ok_or(RuntimeWorkerError::ProcessUnavailable)
     }
 
-    async fn spawn_worker(&self) -> Result<WorkerProcess, String> {
+    async fn spawn_worker(&self) -> Result<WorkerProcess, RuntimeWorkerError> {
         Self::spawn_worker_cfg(
             &self.php_binary,
             &self.worker_entrypoint,
@@ -416,7 +576,7 @@ impl WorkerSupervisor {
         php_binary: &str,
         worker_entrypoint: &PathBuf,
         app_file: &PathBuf,
-    ) -> Result<WorkerProcess, String> {
+    ) -> Result<WorkerProcess, RuntimeWorkerError> {
         info!(entrypoint = %worker_entrypoint.display(), "starting PHP worker process");
 
         let mut child = Command::new(php_binary)
@@ -424,22 +584,38 @@ impl WorkerSupervisor {
             .arg(app_file)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|error| format!(
-                "failed to spawn PHP worker using '{}' and '{}': {error}",
-                php_binary,
-                worker_entrypoint.display()
-            ))?;
+            .map_err(|source| RuntimeWorkerError::Spawn {
+                php_binary: php_binary.to_string(),
+                worker_entrypoint: worker_entrypoint.clone(),
+                source,
+            })?;
+
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => warn!(target: "php_worker", "{line}"),
+                        Ok(None) => break,
+                        Err(error) => {
+                            warn!(target: "php_worker", %error, "failed to read worker stderr");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| "worker stdin unavailable".to_string())?;
+            .ok_or(RuntimeWorkerError::MissingPipe { pipe: "stdin" })?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| "worker stdout unavailable".to_string())?;
+            .ok_or(RuntimeWorkerError::MissingPipe { pipe: "stdout" })?;
 
         Ok(WorkerProcess {
             child,
@@ -462,13 +638,22 @@ impl WorkerPool {
         count: usize,
         max_requests: u64,
         worker_timeout_ms: u64,
+        worker_boot_timeout_ms: u64,
     ) -> Self {
         let entrypoint = worker_entrypoint.into();
         let app = app_file.into();
         let count = count.max(1);
 
         let workers: Vec<WorkerSupervisor> = (0..count)
-            .map(|_| WorkerSupervisor::new(entrypoint.clone(), app.clone(), worker_timeout_ms, max_requests))
+            .map(|_| {
+                WorkerSupervisor::new(
+                    entrypoint.clone(),
+                    app.clone(),
+                    worker_timeout_ms,
+                    worker_boot_timeout_ms,
+                    max_requests,
+                )
+            })
             .collect();
 
         Self {
@@ -481,7 +666,7 @@ impl WorkerPool {
     }
 
     /// Restart all workers and rebuild the route table from a fresh boot message.
-    pub async fn reload(&self) -> Result<RouteTable, String> {
+    pub async fn reload(&self) -> Result<RouteTable, RuntimeWorkerError> {
         self.restart_all().await;
         self.boot().await
     }
@@ -490,7 +675,7 @@ impl WorkerPool {
     /// the route table; remaining boots complete asynchronously.
     /// Boot all workers in parallel. The first successful boot provides
     /// the route table; remaining boots complete asynchronously.
-    pub async fn boot(&self) -> Result<RouteTable, String> {
+    pub async fn boot(&self) -> Result<RouteTable, RuntimeWorkerError> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let count = self.workers.len();
 
@@ -504,7 +689,7 @@ impl WorkerPool {
         // Drop the last sender so recv completes when all workers fail.
         drop(tx);
 
-        let mut last_err = String::new();
+        let mut last_err: Option<RuntimeWorkerError> = None;
         let mut successes = 0;
 
         while let Some(result) = rx.recv().await {
@@ -517,12 +702,14 @@ impl WorkerPool {
                     }
                 }
                 Err(e) => {
-                    last_err = e;
+                    last_err = Some(e);
                 }
             }
         }
 
-        Err(format!("all workers failed to boot: {last_err}"))
+        Err(RuntimeWorkerError::AllWorkersFailedToBoot {
+            last_error: Box::new(last_err.unwrap_or(RuntimeWorkerError::BootProcessMissing)),
+        })
     }
 
     /// Restart all workers (used by dev mode file watcher).
@@ -542,7 +729,7 @@ impl WorkerPool {
     }
 
     /// Dispatch a request to the worker with the fewest in-flight requests.
-    pub async fn handle(&self, request: WorkerRequest) -> Result<WorkerResponse, String> {
+    pub async fn handle(&self, request: WorkerRequest) -> Result<WorkerResponse, RuntimeWorkerError> {
         let index = self.workers.iter()
             .enumerate()
             .min_by_key(|(_, w)| w.pending_count())
@@ -550,5 +737,130 @@ impl WorkerPool {
             .unwrap_or(0);
 
         self.workers[index].handle(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    struct MockTransport {
+        writes: Vec<String>,
+        reads: VecDeque<Result<String, RuntimeWorkerError>>,
+    }
+
+    #[async_trait]
+    impl WorkerTransport for MockTransport {
+        async fn write_frame(&mut self, json: &str) -> Result<(), RuntimeWorkerError> {
+            self.writes.push(json.to_string());
+            Ok(())
+        }
+
+        async fn read_frame(&mut self, _max_size: u32) -> Result<String, RuntimeWorkerError> {
+            self.reads
+                .pop_front()
+                .unwrap_or_else(|| Err(RuntimeWorkerError::ProcessUnavailable))
+        }
+    }
+
+    fn request(request_id: &str) -> WorkerRequest {
+        WorkerRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request_id.to_string(),
+            method: "GET".into(),
+            path: "/ping".into(),
+            query_string: String::new(),
+            headers: Default::default(),
+            cookies: Default::default(),
+            route_params: Default::default(),
+            body: None,
+            scheme: "http".into(),
+            host: "localhost".into(),
+            client_ip: Some("127.0.0.1".into()),
+            is_secure: false,
+            matched_route: Some("get_ping".into()),
+        }
+    }
+
+    fn response_json(request_id: &str, protocol_version: u32) -> String {
+        serde_json::to_string(&WorkerResponse {
+            protocol_version,
+            request_id: request_id.to_string(),
+            status: 200,
+            headers: Default::default(),
+            cookies: Vec::new(),
+            body: Some("{\"ok\":true}".into()),
+            error: None,
+        })
+        .expect("response should encode")
+    }
+
+    #[tokio::test]
+    async fn dispatch_transport_accepts_valid_response() {
+        let req = request("req_1");
+        let mut transport = MockTransport {
+            writes: Vec::new(),
+            reads: VecDeque::from([Ok(response_json("req_1", PROTOCOL_VERSION))]),
+        };
+
+        let response = WorkerSupervisor::dispatch_transport(
+            &mut transport,
+            &req,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("response should succeed");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(transport.writes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_transport_rejects_request_id_mismatch() {
+        let req = request("req_expected");
+        let mut transport = MockTransport {
+            writes: Vec::new(),
+            reads: VecDeque::from([Ok(response_json("req_other", PROTOCOL_VERSION))]),
+        };
+
+        let error = WorkerSupervisor::dispatch_transport(
+            &mut transport,
+            &req,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("request id mismatch should fail");
+
+        assert!(matches!(
+            error,
+            RuntimeWorkerError::RequestIdMismatch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_boot_message_rejects_protocol_mismatch() {
+        let boot = serde_json::to_string(&BootMessage {
+            protocol_version: PROTOCOL_VERSION + 1,
+            message_type: "boot".into(),
+            routes: Vec::new(),
+        })
+        .expect("boot should encode");
+        let mut transport = MockTransport {
+            writes: Vec::new(),
+            reads: VecDeque::from([Ok(boot)]),
+        };
+
+        let error = WorkerSupervisor::read_boot_message(
+            &mut transport,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("protocol mismatch should fail");
+
+        assert!(matches!(
+            error,
+            RuntimeWorkerError::ProtocolVersionMismatch { .. }
+        ));
     }
 }

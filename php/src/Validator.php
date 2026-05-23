@@ -81,6 +81,15 @@ final class Validator
             $value = $this->data[$field] ?? null;
             $fieldErrors = [];
 
+            if (
+                $value === null
+                && in_array('nullable', $fieldRules, true)
+                && !in_array('required', $fieldRules, true)
+            ) {
+                $this->validated[$field] = null;
+                continue;
+            }
+
             foreach ($fieldRules as $rule) {
                 $error = $this->checkRule($field, $value, $rule);
 
