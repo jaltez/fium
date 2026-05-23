@@ -168,11 +168,11 @@ final class Validator
             return null;
         }
 
-        if (is_string($value) && mb_strlen($value) < $min) {
+        if (is_string($value) && !is_numeric($value) && mb_strlen($value) < $min) {
             return "The {$field} field must be at least {$min} characters.";
         }
 
-        if (is_int($value) && $value < $min) {
+        if (is_numeric($value) && (int) $value < $min) {
             return "The {$field} field must be at least {$min}.";
         }
 
@@ -189,11 +189,11 @@ final class Validator
             return null;
         }
 
-        if (is_string($value) && mb_strlen($value) > $max) {
+        if (is_string($value) && !is_numeric($value) && mb_strlen($value) > $max) {
             return "The {$field} field must not exceed {$max} characters.";
         }
 
-        if (is_int($value) && $value > $max) {
+        if (is_numeric($value) && (int) $value > $max) {
             return "The {$field} field must not exceed {$max}.";
         }
 

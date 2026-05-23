@@ -30,15 +30,76 @@ if ($stdin === false || $stdout === false) {
     exit(1);
 }
 
+/**
+ * Write a length-prefixed JSON frame to a stream.
+ * Format: 4-byte big-endian u32 length, followed by the payload.
+ */
+function write_frame($handle, string $payload): void
+{
+    $len = strlen($payload);
+    $header = pack('N', $len);
+    $data = $header . $payload;
+    $remaining = strlen($data);
+    $offset = 0;
+    while ($remaining > 0) {
+        $written = fwrite($handle, substr($data, $offset, $remaining));
+        if ($written === false) {
+            break;
+        }
+        $offset += $written;
+        $remaining -= $written;
+    }
+}
+
+/**
+ * Read a length-prefixed JSON frame from a stream.
+ * Returns the decoded array, or null on EOF or malformed frame.
+ */
+function read_frame($handle): ?array
+{
+    // Read 4-byte length header
+    $header = '';
+    while (strlen($header) < 4) {
+        $chunk = fread($handle, 4 - strlen($header));
+        if ($chunk === false || $chunk === '') {
+            return null;
+        }
+        $header .= $chunk;
+    }
+
+    $arr = unpack('N', $header);
+    $len = $arr[1];
+
+    if ($len > 16 * 1024 * 1024) {
+        // Frame too large — drain and return error
+        return null;
+    }
+
+    $body = '';
+    while (strlen($body) < $len) {
+        $chunk = fread($handle, $len - strlen($body));
+        if ($chunk === false || $chunk === '') {
+            return null;
+        }
+        $body .= $chunk;
+    }
+
+    return json_decode($body, true);
+}
+
 // Boot protocol: send route manifest as first message
-fwrite($stdout, $application->bootManifest() . PHP_EOL);
+write_frame($stdout, $application->bootManifest());
 fflush($stdout);
 
-while (($line = fgets($stdin)) !== false) {
-    $request = json_decode(trim($line), true);
+while (true) {
+    $request = read_frame($stdin);
+
+    if ($request === null) {
+        break;
+    }
 
     if (!is_array($request)) {
-        fwrite($stdout, json_encode([
+        write_frame($stdout, json_encode([
             'protocol_version' => 1,
             'request_id' => null,
             'status' => 500,
@@ -46,7 +107,7 @@ while (($line = fgets($stdin)) !== false) {
             'cookies' => [],
             'body' => '{"ok":false,"error":"invalid_request"}',
             'error' => ['kind' => 'invalid_request', 'message' => 'Malformed request frame'],
-        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . PHP_EOL);
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
         fflush($stdout);
         continue;
     }
@@ -54,7 +115,7 @@ while (($line = fgets($stdin)) !== false) {
     // Validate protocol version before dispatching.
     $protocolVersion = isset($request['protocol_version']) ? (int) $request['protocol_version'] : 0;
     if ($protocolVersion !== 1) {
-        fwrite($stdout, json_encode([
+        write_frame($stdout, json_encode([
             'protocol_version' => 1,
             'request_id' => $request['request_id'] ?? null,
             'status' => 500,
@@ -62,13 +123,13 @@ while (($line = fgets($stdin)) !== false) {
             'cookies' => [],
             'body' => '{"ok":false,"error":"protocol_version_mismatch"}',
             'error' => ['kind' => 'protocol_version_mismatch', 'message' => "Protocol version {$protocolVersion} is not supported"],
-        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . PHP_EOL);
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
         fflush($stdout);
         continue;
     }
 
     $response = $application->handleWorkerRequest($request);
 
-    fwrite($stdout, json_encode($response, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . PHP_EOL);
+    write_frame($stdout, json_encode($response, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
     fflush($stdout);
 }

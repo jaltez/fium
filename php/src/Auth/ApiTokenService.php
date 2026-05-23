@@ -18,6 +18,12 @@ final class ApiTokenService
         $secret = \Fium\Config::get('FIUM_API_TOKEN_SECRET');
 
         if ($secret === null || $secret === '') {
+            $debug = \Fium\Config::bool('FIUM_DEBUG');
+            if (!$debug) {
+                throw new \RuntimeException(
+                    'FIUM_API_TOKEN_SECRET is not set. Set it in .env for production.'
+                );
+            }
             $secret = 'fium-dev-api-secret';
             fwrite(STDERR, "[fium] WARNING: FIUM_API_TOKEN_SECRET is not set, using insecure default. Set it in .env for production.\n");
         }

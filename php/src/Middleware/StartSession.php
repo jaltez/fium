@@ -16,31 +16,34 @@ final class StartSession implements Middleware
 {
     private const COOKIE_NAME = 'fium_session';
 
+    private SessionStore $store;
+
+    public function __construct()
+    {
+        // Resolve the store once at construction time.
+        // Since StartSession is cached in Application::$middlewareCache,
+        // this runs only once per worker's lifetime.
+        $driver = Config::get('FIUM_SESSION_DRIVER', 'file');
+
+        if ($driver === 'pdo') {
+            $dsn = Config::get('FIUM_SESSION_DSN', 'sqlite:' . dirname(__DIR__, 2) . '/storage/sessions.db');
+            $this->store = new PdoSessionStore($dsn);
+        } else {
+            $this->store = new FileSessionStore(dirname(__DIR__, 2) . '/storage/sessions');
+        }
+    }
+
     public function handle(Request $request, callable $next): Response
     {
-        $baseDir = $request->attribute('base_dir') ?? dirname(__DIR__, 2);
-        $store = $this->resolveStore($baseDir);
-        $session = $store->load($request->cookie(self::COOKIE_NAME));
+        $session = $this->store->load($request->cookie(self::COOKIE_NAME));
         $request->setSession($session);
 
         $response = $next($request);
 
         if ($session->isDirty() || $session->isNew()) {
-            $store->save($session);
+            $this->store->save($session);
         }
 
         return $response->withCookie(self::COOKIE_NAME, $session->id(), '/');
-    }
-
-    private function resolveStore(string $baseDir): SessionStore
-    {
-        $driver = Config::get('FIUM_SESSION_DRIVER', 'file');
-
-        if ($driver === 'pdo') {
-            $dsn = Config::get('FIUM_SESSION_DSN', 'sqlite:' . $baseDir . '/storage/sessions.db');
-            return new PdoSessionStore($dsn);
-        }
-
-        return new FileSessionStore($baseDir . '/storage/sessions');
     }
 }

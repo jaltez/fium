@@ -301,6 +301,7 @@ async fn health(
         let total_requests: u64 = workers.iter().map(|w| w.requests_handled()).sum();
         let total_restarts: u64 = workers.iter().map(|w| w.restarts()).sum();
         let total_errors: u64 = workers.iter().map(|w| w.errors()).sum();
+        let total_pending: usize = workers.iter().map(|w| w.pending_count()).sum();
         let uptime = state.start_time.elapsed().as_secs();
 
         let json = serde_json::json!({
@@ -310,6 +311,7 @@ async fn health(
             "requests_total": total_requests,
             "restarts_total": total_restarts,
             "errors_total": total_errors,
+            "pending_requests": total_pending,
         });
 
         (
@@ -327,6 +329,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
     let total_requests: u64 = workers.iter().map(|w| w.requests_handled()).sum();
     let total_restarts: u64 = workers.iter().map(|w| w.restarts()).sum();
     let total_errors: u64 = workers.iter().map(|w| w.errors()).sum();
+    let total_pending: usize = workers.iter().map(|w| w.pending_count()).sum();
     let uptime = state.start_time.elapsed().as_secs();
 
     let body = format!(
@@ -342,6 +345,9 @@ async fn metrics(State(state): State<AppState>) -> Response {
          # HELP fium_workers_total Total number of worker processes.\n\
          # TYPE fium_workers_total gauge\n\
          fium_workers_total {workers}\n\
+         # HELP fium_worker_pending_requests Number of requests queued across all workers.\n\
+         # TYPE fium_worker_pending_requests gauge\n\
+         fium_worker_pending_requests {total_pending}\n\
          # HELP fium_uptime_seconds Server uptime in seconds.\n\
          # TYPE fium_uptime_seconds gauge\n\
          fium_uptime_seconds {uptime}\n",
@@ -445,7 +451,7 @@ async fn dispatch(
         .to_string();
 
     // Only trust X-Forwarded-* headers from trusted proxies
-    let is_trusted_proxy = is_trusted_proxy_addr(&addr);
+    let is_trusted_proxy = state.config.trusted_proxies.contains(&addr);
     let scheme = if state.config.tls_enabled() {
         "https".to_string()
     } else if is_trusted_proxy {
@@ -721,24 +727,6 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
         .await?;
 
     Ok(())
-}
-
-fn is_trusted_proxy_addr(addr: &SocketAddr) -> bool {
-    let trusted = std::env::var("FIUM_TRUSTED_PROXIES").unwrap_or_default();
-    let ip = addr.ip();
-
-    if trusted.is_empty() {
-        // Default: trust loopback only
-        return ip.is_loopback();
-    }
-
-    if trusted == "*" {
-        return true;
-    }
-
-    trusted
-        .split(',')
-        .any(|p| p.trim().parse::<std::net::IpAddr>().map_or(false, |trusted_ip| trusted_ip == ip))
 }
 
 async fn shutdown_signal() {

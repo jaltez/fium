@@ -24,6 +24,19 @@ pub struct RuntimeConfig {
     // Static files
     pub static_dir: Option<PathBuf>,
     pub static_enabled: bool,
+
+    // Trusted proxies (cached from env at startup)
+    pub trusted_proxies: TrustedProxies,
+}
+
+#[derive(Debug, Clone)]
+pub enum TrustedProxies {
+    /// No trusted proxies (matches empty string or unset)
+    None,
+    /// Trust all proxies (matches "*")
+    All,
+    /// Trust specific IPs
+    Some(Vec<std::net::IpAddr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +103,31 @@ fn parse_size(s: &str) -> Option<usize> {
         num.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024 * 1024)
     } else {
         s.parse::<usize>().ok()
+    }
+}
+
+impl TrustedProxies {
+    pub fn from_env() -> Self {
+        let trusted = std::env::var("FIUM_TRUSTED_PROXIES").unwrap_or_default();
+        if trusted.is_empty() {
+            TrustedProxies::None
+        } else if trusted == "*" {
+            TrustedProxies::All
+        } else {
+            let ips: Vec<std::net::IpAddr> = trusted
+                .split(',')
+                .filter_map(|p| p.trim().parse().ok())
+                .collect();
+            TrustedProxies::Some(ips)
+        }
+    }
+
+    pub fn contains(&self, addr: &std::net::SocketAddr) -> bool {
+        match self {
+            TrustedProxies::None => addr.ip().is_loopback(),
+            TrustedProxies::All => true,
+            TrustedProxies::Some(ips) => ips.iter().any(|ip| *ip == addr.ip()),
+        }
     }
 }
 
@@ -171,6 +209,7 @@ impl RuntimeConfig {
             log_format,
             static_dir,
             static_enabled: toml.static_files.enabled.unwrap_or(false),
+            trusted_proxies: TrustedProxies::from_env(),
         }
     }
 

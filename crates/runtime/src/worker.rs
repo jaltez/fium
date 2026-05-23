@@ -1,6 +1,6 @@
 use fium_transport::{BootMessage, WorkerRequest, WorkerResponse, PROTOCOL_VERSION};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot, Mutex},
     time::{timeout, Duration},
@@ -11,6 +11,9 @@ use std::{path::PathBuf, sync::Arc};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::route::RouteTable;
+
+/// Maximum frame size accepted from a PHP worker (16 MB).
+const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
 // Messages sent from WorkerSupervisor::handle() to the per-worker background task.
 enum WorkerMessage {
@@ -133,10 +136,11 @@ impl WorkerSupervisor {
         let worker = self.spawn_worker().await?;
         *process = Some(worker);
 
-        let worker = process.as_mut().unwrap();
+        let worker = process
+            .as_mut()
+            .ok_or_else(|| "worker process disappeared before boot message".to_string())?;
 
-        let mut line = String::new();
-        let bytes_read = timeout(self.boot_timeout, worker.stdout.read_line(&mut line))
+        let line = timeout(self.boot_timeout, Self::read_frame(&mut worker.stdout, MAX_FRAME_SIZE))
             .await
             .map_err(|_| {
                 format!(
@@ -146,11 +150,7 @@ impl WorkerSupervisor {
             })?
             .map_err(|error| format!("failed to read worker boot message: {error}"))?;
 
-        if bytes_read == 0 {
-            return Err("worker closed stdout before sending boot message".to_string());
-        }
-
-        let boot: BootMessage = serde_json::from_str(line.trim_end())
+        let boot: BootMessage = serde_json::from_str(&line)
             .map_err(|error| format!("failed to parse worker boot message: {error}"))?;
 
         if boot.message_type != "boot" {
@@ -264,6 +264,44 @@ impl WorkerSupervisor {
         }
     }
 
+    /// Write a length-prefixed JSON frame to a writer.
+    async fn write_frame<T: tokio::io::AsyncWrite + Unpin>(
+        writer: &mut T,
+        json: &str,
+    ) -> Result<(), String> {
+        let len = json.len() as u32;
+        writer.write_all(&len.to_be_bytes()).await
+            .map_err(|e| format!("failed to write frame length: {e}"))?;
+        writer.write_all(json.as_bytes()).await
+            .map_err(|e| format!("failed to write frame body: {e}"))?;
+        writer.flush().await
+            .map_err(|e| format!("failed to flush frame: {e}"))
+    }
+
+    /// Read a length-prefixed JSON frame from a buffered reader.
+    async fn read_frame(
+        reader: &mut BufReader<ChildStdout>,
+        max_size: u32,
+    ) -> Result<String, String> {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await
+            .map_err(|e| format!("failed to read frame length: {e}"))?;
+        let len = u32::from_be_bytes(len_buf);
+
+        if len > max_size {
+            return Err(format!(
+                "worker frame too large: {len} bytes (max {max_size})"
+            ));
+        }
+
+        let mut body = vec![0u8; len as usize];
+        reader.read_exact(&mut body).await
+            .map_err(|e| format!("failed to read frame body: {e}"))?;
+
+        String::from_utf8(body)
+            .map_err(|e| format!("worker frame contained invalid UTF-8: {e}"))
+    }
+
     async fn dispatch_once(
         _php_binary: &str,
         _worker_entrypoint: &PathBuf,
@@ -278,34 +316,17 @@ impl WorkerSupervisor {
         let encoded = serde_json::to_string(request)
             .map_err(|error| format!("failed to encode worker request: {error}"))?;
 
-        timeout(request_timeout, async {
-            process
-                .stdin
-                .write_all(encoded.as_bytes())
-                .await
-                .map_err(|error| format!("failed to write request to worker stdin: {error}"))?;
-            process
-                .stdin
-                .write_all(b"\n")
-                .await
-                .map_err(|error| format!("failed to frame worker request: {error}"))?;
-            process
-                .stdin
-                .flush()
-                .await
-                .map_err(|error| format!("failed to flush worker request: {error}"))
-        })
-        .await
-        .map_err(|_| {
-            format!(
-                "worker request timed out while writing request {} after {} ms",
-                request.request_id,
-                request_timeout.as_millis()
-            )
-        })??;
+        timeout(request_timeout, Self::write_frame(&mut process.stdin, &encoded))
+            .await
+            .map_err(|_| {
+                format!(
+                    "worker request timed out while writing request {} after {} ms",
+                    request.request_id,
+                    request_timeout.as_millis()
+                )
+            })??;
 
-        let mut line = String::new();
-        let bytes_read = timeout(request_timeout, process.stdout.read_line(&mut line))
+        let frame = timeout(request_timeout, Self::read_frame(&mut process.stdout, MAX_FRAME_SIZE))
             .await
             .map_err(|_| {
                 format!(
@@ -313,14 +334,9 @@ impl WorkerSupervisor {
                     request.request_id,
                     request_timeout.as_millis()
                 )
-            })?
-            .map_err(|error| format!("failed to read worker response: {error}"))?;
+            })??;
 
-        if bytes_read == 0 {
-            return Err("worker closed stdout unexpectedly".to_string());
-        }
-
-        let response: WorkerResponse = serde_json::from_str(line.trim_end())
+        let response: WorkerResponse = serde_json::from_str(&frame)
             .map_err(|error| format!("failed to decode worker response: {error}"))?;
 
         if response.protocol_version != PROTOCOL_VERSION {
@@ -352,8 +368,7 @@ impl WorkerSupervisor {
 
         let mut worker = Self::spawn_worker_cfg(php_binary, worker_entrypoint, app_file).await?;
         // Consume the boot message that every new PHP worker emits on startup.
-        let mut boot_line = String::new();
-        timeout(boot_timeout, worker.stdout.read_line(&mut boot_line))
+        timeout(boot_timeout, Self::read_frame(&mut worker.stdout, MAX_FRAME_SIZE))
             .await
             .map_err(|_| "timed out waiting for boot message from restarted worker".to_string())?
             .map_err(|error| format!("failed to read boot message from restarted worker: {error}"))?;
