@@ -4,54 +4,21 @@ declare(strict_types=1);
 
 namespace Fium\Auth;
 
-use Fium\Contracts\TokenService;
-
-final class ApiTokenService implements TokenService
+final class PasswordResetTokenService
 {
     public function __construct(
         private Authenticator $authenticator,
         private string $secret,
         private int $ttlSeconds = 3600,
-        private int $refreshTtlSeconds = 2_592_000,
     ) {
     }
 
     public static function boot(Authenticator $authenticator): self
     {
-        return new self($authenticator, SigningSecret::resolve('API token'), 3600, 2_592_000);
+        return new self($authenticator, SigningSecret::resolve('Password reset token'), 3600);
     }
 
     public function issue(User $user): string
-    {
-        return $this->issueToken($user, 'access', $this->ttlSeconds);
-    }
-
-    public function issueRefreshToken(User $user): string
-    {
-        return $this->issueToken($user, 'refresh', $this->refreshTtlSeconds);
-    }
-
-    public function userFromToken(string $token): ?User
-    {
-        return $this->userFromSignedToken($token, 'access');
-    }
-
-    public function userFromRefreshToken(string $token): ?User
-    {
-        return $this->userFromSignedToken($token, 'refresh');
-    }
-
-    public function ttlSeconds(): int
-    {
-        return $this->ttlSeconds;
-    }
-
-    public function refreshTtlSeconds(): int
-    {
-        return $this->refreshTtlSeconds;
-    }
-
-    private function issueToken(User $user, string $purpose, int $ttlSeconds): string
     {
         $header = [
             'alg' => 'HS256',
@@ -59,12 +26,9 @@ final class ApiTokenService implements TokenService
         ];
         $payload = [
             'sub' => $user->id(),
-            'purpose' => $purpose,
-            'email' => $user->email(),
-            'role' => $user->role(),
-            'ver' => $user->tokenVersion(),
+            'purpose' => 'password_reset',
             'iat' => time(),
-            'exp' => time() + $ttlSeconds,
+            'exp' => time() + $this->ttlSeconds,
         ];
 
         $encodedHeader = $this->base64UrlEncode(json_encode($header) ?: '{}');
@@ -74,7 +38,7 @@ final class ApiTokenService implements TokenService
         return "{$encodedHeader}.{$encodedPayload}.{$signature}";
     }
 
-    private function userFromSignedToken(string $token, string $expectedPurpose): ?User
+    public function userFromToken(string $token): ?User
     {
         $parts = explode('.', $token);
 
@@ -103,23 +67,21 @@ final class ApiTokenService implements TokenService
         $purpose = $payload['purpose'] ?? null;
         $exp = $payload['exp'] ?? null;
         $sub = $payload['sub'] ?? null;
-        $ver = $payload['ver'] ?? null;
 
-        if ($purpose !== $expectedPurpose || !is_int($exp) || $exp < time()) {
+        if ($purpose !== 'password_reset' || !is_int($exp) || $exp < time()) {
             return null;
         }
 
-        if ((!is_int($sub) && !is_string($sub)) || (!is_int($ver) && !is_string($ver))) {
+        if (!is_int($sub) && !is_string($sub)) {
             return null;
         }
 
-        $user = $this->authenticator->userById((int) $sub);
+        return $this->authenticator->userById((int) $sub);
+    }
 
-        if ($user === null || $user->tokenVersion() !== (int) $ver) {
-            return null;
-        }
-
-        return $user;
+    public function ttlSeconds(): int
+    {
+        return $this->ttlSeconds;
     }
 
     private function sign(string $payload): string

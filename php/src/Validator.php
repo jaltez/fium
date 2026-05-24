@@ -30,7 +30,12 @@ final class Validator
      */
     public static function make(Request $request, array $rules): self
     {
-        $data = $request->json() ?? [];
+        $data = [];
+
+        foreach (array_keys($rules) as $field) {
+            $data[$field] = $request->input((string) $field);
+        }
+
         $validator = new self($data);
         $validator->applyRules($rules);
 

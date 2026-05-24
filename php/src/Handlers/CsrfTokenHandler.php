@@ -12,20 +12,13 @@ final class CsrfTokenHandler implements Handler
 {
     public function __invoke(Request $request): Response
     {
-        $session = $request->session();
+        $token = $request->csrfToken();
 
-        if ($session === null) {
+        if (!is_string($token) || $token === '') {
             return Response::json([
                 'ok' => false,
                 'error' => 'session_unavailable',
             ], 500);
-        }
-
-        $token = $session->get('csrf_token');
-
-        if (!is_string($token) || $token === '') {
-            $token = bin2hex(random_bytes(20));
-            $session->put('csrf_token', $token);
         }
 
         return Response::json([

@@ -775,6 +775,7 @@ mod tests {
             cookies: Default::default(),
             route_params: Default::default(),
             body: None,
+            body_file: None,
             scheme: "http".into(),
             host: "localhost".into(),
             client_ip: Some("127.0.0.1".into()),

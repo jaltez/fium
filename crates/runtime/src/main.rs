@@ -5,7 +5,7 @@ mod worker;
 
 use arc_swap::ArcSwap;
 use axum::{
-    body::{to_bytes, Body},
+    body::Body,
     extract::{ConnectInfo, Request, State},
     http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -15,6 +15,7 @@ use axum::{
 use clap::Parser;
 use config::{CompressionConfig, LogFormat, RuntimeConfig};
 use fium_transport::{CookieMap, HeaderMap, SetCookie, WorkerRequest, PROTOCOL_VERSION};
+use http_body_util::BodyExt;
 use route::RouteTable;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
@@ -26,7 +27,7 @@ use std::{
     },
     time::Instant,
 };
-use tokio::time::Duration;
+use tokio::{fs::File, io::AsyncWriteExt, time::Duration};
 use tower_http::compression::{CompressionLayer, CompressionLevel, predicate::SizeAbove};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{error, info, warn};
@@ -656,21 +657,13 @@ async fn dispatch(
     let cookies = parse_cookies(request.headers());
     let body_max = state.config.body_max_size;
 
-    // Skip body buffering for methods that never carry a payload.
-    let body = if matches!(method.as_str(), "GET" | "HEAD") {
-        None
+    // Skip body capture for methods that never carry a payload.
+    let (body, body_file) = if matches!(method.as_str(), "GET" | "HEAD") {
+        (None, None)
     } else {
-        let body_bytes = match to_bytes(request.into_body(), body_max).await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                error!(%error, request_id, "failed to read request body");
-                return (StatusCode::BAD_REQUEST, "invalid request body").into_response();
-            }
-        };
-        if body_bytes.is_empty() {
-            None
-        } else {
-            Some(String::from_utf8_lossy(&body_bytes).to_string())
+        match stream_request_body_to_file(request.into_body(), body_max, &request_id).await {
+            Ok(result) => result,
+            Err(response) => return response,
         }
     };
 
@@ -684,6 +677,7 @@ async fn dispatch(
         cookies,
         route_params: route_match.params,
         body,
+        body_file: body_file.clone(),
         scheme,
         host,
         client_ip: Some(client_ip),
@@ -694,7 +688,15 @@ async fn dispatch(
     let log_method = worker_request.method.clone();
     let log_path = worker_request.path.clone();
 
-    match state.pool.handle(worker_request).await {
+    let result = state.pool.handle(worker_request).await;
+
+    if let Some(body_file) = body_file {
+        if let Err(error) = tokio::fs::remove_file(&body_file).await {
+            warn!(%error, request_id, body_file, "failed to remove streamed request body file");
+        }
+    }
+
+    match result {
         Ok(worker_response) => {
             let elapsed = start.elapsed();
             state.request_latency.record(elapsed);
@@ -755,6 +757,76 @@ async fn dispatch(
             (status, "worker dispatch failed").into_response()
         }
     }
+}
+
+async fn stream_request_body_to_file(
+    mut body: Body,
+    body_max: usize,
+    request_id: &str,
+) -> Result<(Option<String>, Option<String>), Response> {
+    let mut total = 0usize;
+    let mut temp_path: Option<PathBuf> = None;
+    let mut temp_file: Option<File> = None;
+
+    while let Some(frame_result) = body.frame().await {
+        let frame = match frame_result {
+            Ok(frame) => frame,
+            Err(error) => {
+                error!(%error, %request_id, "failed to stream request body");
+                if let Some(path) = temp_path {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+                return Err((StatusCode::BAD_REQUEST, "invalid request body").into_response());
+            }
+        };
+
+        let Some(chunk) = frame.data_ref().cloned() else {
+            continue;
+        };
+
+        total += chunk.len();
+        if total > body_max {
+            if let Some(path) = temp_path {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response());
+        }
+
+        if temp_file.is_none() {
+            let path = std::env::temp_dir().join(format!("fium-body-{}.tmp", Uuid::new_v4()));
+            let file = match File::create(&path).await {
+                Ok(file) => file,
+                Err(error) => {
+                    error!(%error, %request_id, path = %path.display(), "failed to create request body temp file");
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+                }
+            };
+            temp_path = Some(path);
+            temp_file = Some(file);
+        }
+
+        if let Some(file) = &mut temp_file {
+            if let Err(error) = file.write_all(&chunk).await {
+                error!(%error, %request_id, "failed to write streamed request body");
+                if let Some(path) = temp_path {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+            }
+        }
+    }
+
+    if let Some(mut file) = temp_file {
+        if let Err(error) = file.flush().await {
+            error!(%error, %request_id, "failed to flush streamed request body");
+            if let Some(path) = temp_path {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+        }
+    }
+
+    Ok((None, temp_path.map(|path| path.to_string_lossy().to_string())))
 }
 
 fn init_project(directory: &PathBuf) -> anyhow::Result<()> {

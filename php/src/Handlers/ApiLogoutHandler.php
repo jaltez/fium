@@ -8,36 +8,32 @@ use Fium\Contracts\Handler;
 use Fium\Runtime\Request;
 use Fium\Runtime\Response;
 
-final class LoginHandler implements Handler
+final class ApiLogoutHandler implements Handler
 {
     public function __invoke(Request $request): Response
     {
-        $session = $request->session();
         $authenticator = $request->authenticator();
-        $payload = [
-            'email' => $request->input('email'),
-            'password' => $request->input('password'),
-        ];
+        $user = $request->user();
 
-        if ($session === null || $authenticator === null) {
+        if ($authenticator === null || $user === null || !$authenticator->canRevokeTokens()) {
             return Response::json([
                 'ok' => false,
                 'error' => 'auth_unavailable',
             ], 500);
         }
 
-        $user = $authenticator->attempt($payload, $session, $request->boolean('remember'));
+        $revokedUser = $authenticator->revokeTokens($user);
 
-        if ($user === null) {
+        if ($revokedUser === null) {
             return Response::json([
                 'ok' => false,
-                'error' => 'invalid_credentials',
-            ], 401);
+                'error' => 'auth_unavailable',
+            ], 500);
         }
 
         return Response::json([
             'ok' => true,
-            'user' => $user->toArray(),
+            'revoked' => true,
         ]);
     }
 }

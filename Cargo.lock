@@ -441,6 +441,7 @@ dependencies = [
  "axum-server",
  "clap",
  "fium-transport",
+ "http-body-util",
  "include_dir",
  "libc",
  "notify",

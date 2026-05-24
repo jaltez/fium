@@ -15,6 +15,7 @@ use Fium\Session\SessionStore;
 final class StartSession implements Middleware
 {
     private const COOKIE_NAME = 'fium_session';
+    private const REMEMBER_ME_MAX_AGE = 2_592_000;
 
     private SessionStore $store;
 
@@ -36,14 +37,32 @@ final class StartSession implements Middleware
     public function handle(Request $request, callable $next): Response
     {
         $session = $this->store->load($request->cookie(self::COOKIE_NAME));
+        $session->ageFlashData();
         $request->setSession($session);
 
         $response = $next($request);
 
-        if ($session->isDirty() || $session->isNew()) {
-            $this->store->save($session);
+        if ($session->needsRegeneration()) {
+            $this->store->regenerate($session);
         }
 
-        return $response->withCookie(self::COOKIE_NAME, $session->id(), '/');
+        if ($session->isDirty() || $session->isNew()) {
+            $previousId = $session->previousId();
+            $this->store->save($session);
+            if ($previousId !== null) {
+                $this->store->delete($previousId);
+                $session->clearPreviousId();
+            }
+        }
+
+        return $response->withCookie(
+            self::COOKIE_NAME,
+            $session->id(),
+            '/',
+            true,
+            false,
+            'Lax',
+            $session->remembers() ? self::REMEMBER_ME_MAX_AGE : null,
+        );
     }
 }

@@ -48,6 +48,14 @@ final class FileSessionStore extends AbstractSessionStore
         file_put_contents($this->pathFor($session->id()), $json . PHP_EOL, LOCK_EX);
     }
 
+    public function delete(string $sessionId): void
+    {
+        $path = $this->pathFor($sessionId);
+        if (is_file($path)) {
+            unlink($path);
+        }
+    }
+
     private function pathFor(string $sessionId): string
     {
         return rtrim($this->directory, '/') . '/' . $sessionId . '.json';

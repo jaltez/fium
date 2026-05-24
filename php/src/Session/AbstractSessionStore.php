@@ -6,6 +6,15 @@ namespace Fium\Session;
 
 abstract class AbstractSessionStore implements SessionStore
 {
+    public function regenerate(Session $session): void
+    {
+        if (!$session->needsRegeneration()) {
+            return;
+        }
+
+        $session->rotateTo($this->generateId());
+    }
+
     protected function normalizeId(?string $sessionId): ?string
     {
         if ($sessionId === null || $sessionId === '') {

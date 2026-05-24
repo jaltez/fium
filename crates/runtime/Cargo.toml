@@ -16,7 +16,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 rcgen = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["compression-gzip", "compression-br", "fs", "set-header"] }
 tracing = { version = "0.1", features = ["attributes"] }
@@ -30,3 +30,4 @@ libc = "0.2"
 socket2 = "0.5"
 thiserror = "1"
 async-trait = "0.1"
+http-body-util = "0.1"

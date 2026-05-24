@@ -26,6 +26,11 @@ return [
         'handler' => 'Fium\\Handlers\\LoginHandler',
     ],
 
+    'POST /register' => [
+        'middleware' => ['start-session', 'verify-csrf'],
+        'handler' => 'Fium\\Handlers\\RegisterHandler',
+    ],
+
     'POST /logout' => [
         'middleware' => ['start-session', 'verify-csrf'],
         'handler' => 'Fium\\Handlers\\LogoutHandler',
@@ -35,6 +40,8 @@ return [
         'middleware' => ['start-session', 'auth-session'],
         'handler' => 'Fium\\Handlers\\CurrentUserHandler',
     ],
+
+    'GET /email/verify' => 'Fium\\Handlers\\VerifyEmailHandler',
 
     'GET /admin' => [
         'middleware' => ['start-session', 'auth-session', 'role:admin'],
@@ -46,7 +53,19 @@ return [
         'prefix' => '/api',
         'middleware' => ['require-json'],
         'routes' => [
+            'POST /forgot-password' => 'Fium\\Handlers\\PasswordResetLinkHandler',
+            'POST /reset-password' => 'Fium\\Handlers\\ResetPasswordHandler',
+            'POST /register' => 'Fium\\Handlers\\ApiRegisterHandler',
             'POST /login' => 'Fium\\Handlers\\ApiLoginHandler',
+            'POST /refresh' => 'Fium\\Handlers\\ApiRefreshTokenHandler',
+            'POST /logout' => [
+                'middleware' => ['auth-bearer'],
+                'handler' => 'Fium\\Handlers\\ApiLogoutHandler',
+            ],
+            'POST /email/verification-link' => [
+                'middleware' => ['auth-bearer'],
+                'handler' => 'Fium\\Handlers\\EmailVerificationLinkHandler',
+            ],
             'GET /me' => [
                 'middleware' => ['auth-bearer'],
                 'handler' => 'Fium\\Handlers\\ApiMeHandler',
@@ -76,16 +95,4 @@ return [
     // Redirect example
     'GET /old-page' => fn(Request $r) => Response::redirect('/welcome'),
 
-    // Validation example
-    'POST /register' => fn(Request $r) => (function() use ($r) {
-        $v = $r->validate([
-            'email' => 'required|email',
-            'password' => 'required|string|min:6',
-            'name' => 'required|string|min:2|max:100',
-        ]);
-        if ($v->fails()) {
-            return Response::validationError($v->errors());
-        }
-        return Response::json(['ok' => true, 'data' => $v->validated()]);
-    })(),
 ];

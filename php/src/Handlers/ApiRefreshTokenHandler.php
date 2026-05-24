@@ -8,30 +8,34 @@ use Fium\Contracts\Handler;
 use Fium\Runtime\Request;
 use Fium\Runtime\Response;
 
-final class ApiLoginHandler implements Handler
+final class ApiRefreshTokenHandler implements Handler
 {
     public function __invoke(Request $request): Response
     {
-        $authenticator = $request->authenticator();
         $tokenService = $request->tokenService();
-        $payload = [
-            'email' => $request->input('email'),
-            'password' => $request->input('password'),
-        ];
 
-        if ($authenticator === null || $tokenService === null) {
+        if ($tokenService === null) {
             return Response::json([
                 'ok' => false,
                 'error' => 'auth_unavailable',
             ], 500);
         }
 
-        $user = $authenticator->validateCredentials($payload);
+        $validator = $request->validate([
+            'refresh_token' => 'required|string',
+        ]);
+
+        if ($validator->fails()) {
+            return Response::validationError($validator->errors());
+        }
+
+        $payload = $validator->validated();
+        $user = $tokenService->userFromRefreshToken((string) ($payload['refresh_token'] ?? ''));
 
         if ($user === null) {
             return Response::json([
                 'ok' => false,
-                'error' => 'invalid_credentials',
+                'error' => 'invalid_refresh_token',
             ], 401);
         }
 

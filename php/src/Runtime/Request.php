@@ -14,7 +14,11 @@ final class Request
 {
     private ?array $parsedQuery = null;
     private ?array $parsedJson = null;
+    private ?array $parsedForm = null;
+    private ?string $loadedBody = null;
+    private bool $bodyLoaded = false;
     private bool $jsonParsed = false;
+    private bool $formParsed = false;
 
     /** @param array<string, mixed> $payload */
     private function __construct(private array $payload)
@@ -40,6 +44,36 @@ final class Request
     public function method(): string
     {
         return (string) ($this->payload['method'] ?? 'GET');
+    }
+
+    public function body(): string
+    {
+        if ($this->bodyLoaded) {
+            return $this->loadedBody ?? '';
+        }
+
+        $this->bodyLoaded = true;
+
+        $body = $this->payload['body'] ?? null;
+
+        if (is_string($body)) {
+            $this->loadedBody = $body;
+
+            return $body;
+        }
+
+        $bodyFile = $this->payload['body_file'] ?? null;
+
+        if (is_string($bodyFile) && $bodyFile !== '' && is_file($bodyFile)) {
+            $contents = file_get_contents($bodyFile);
+            $this->loadedBody = is_string($contents) ? $contents : '';
+
+            return $this->loadedBody;
+        }
+
+        $this->loadedBody = '';
+
+        return '';
     }
 
     public function queryString(): string
@@ -116,6 +150,19 @@ final class Request
         return (string) $values[0];
     }
 
+    public function contentType(): ?string
+    {
+        $contentType = $this->header('content-type');
+
+        if (!is_string($contentType) || $contentType === '') {
+            return null;
+        }
+
+        [$mediaType] = explode(';', $contentType, 2);
+
+        return strtolower(trim($mediaType));
+    }
+
     public function bearerToken(): ?string
     {
         $authorization = $this->header('authorization');
@@ -150,9 +197,9 @@ final class Request
         }
 
         $this->jsonParsed = true;
-        $body = $this->payload['body'] ?? null;
+        $body = $this->body();
 
-        if (!is_string($body) || $body === '') {
+        if ($body === '') {
             return null;
         }
 
@@ -162,12 +209,77 @@ final class Request
         return $this->parsedJson;
     }
 
+    /** @return array<string, mixed>|null */
+    public function form(): ?array
+    {
+        if ($this->formParsed) {
+            return $this->parsedForm;
+        }
+
+        $this->formParsed = true;
+        $body = $this->body();
+
+        if ($body === '') {
+            return null;
+        }
+
+        $contentType = $this->contentType();
+
+        if ($contentType === 'application/x-www-form-urlencoded') {
+            parse_str($body, $parsed);
+            $this->parsedForm = is_array($parsed) ? $parsed : null;
+
+            return $this->parsedForm;
+        }
+
+        if ($contentType === 'multipart/form-data') {
+            $this->parsedForm = $this->parseMultipartForm($body);
+
+            return $this->parsedForm;
+        }
+
+        return null;
+    }
+
     public function input(string $key, mixed $default = null): mixed
     {
         $json = $this->json();
 
         if (is_array($json) && array_key_exists($key, $json)) {
             return $json[$key];
+        }
+
+        $form = $this->form();
+
+        if (is_array($form) && array_key_exists($key, $form)) {
+            return $form[$key];
+        }
+
+        return $default;
+    }
+
+    public function boolean(string $key, bool $default = false): bool
+    {
+        $value = $this->input($key);
+
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        if (is_int($value) || is_float($value)) {
+            return (bool) $value;
+        }
+
+        if (is_string($value)) {
+            $normalized = strtolower(trim($value));
+
+            if (in_array($normalized, ['1', 'true', 'yes', 'on'], true)) {
+                return true;
+            }
+
+            if (in_array($normalized, ['0', 'false', 'no', 'off', ''], true)) {
+                return false;
+            }
         }
 
         return $default;
@@ -206,6 +318,35 @@ final class Request
         $session = $this->attribute('session');
 
         return $session instanceof Session ? $session : null;
+    }
+
+    public function csrfToken(): ?string
+    {
+        $session = $this->session();
+
+        if ($session === null) {
+            return null;
+        }
+
+        $token = $session->get('csrf_token');
+
+        if (!is_string($token) || $token === '') {
+            $token = bin2hex(random_bytes(20));
+            $session->put('csrf_token', $token);
+        }
+
+        return $token;
+    }
+
+    public function csrfField(): string
+    {
+        $token = $this->csrfToken();
+
+        if (!is_string($token) || $token === '') {
+            return '';
+        }
+
+        return '<input type="hidden" name="_token" value="' . htmlspecialchars($token, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">';
     }
 
     public function setUser(User $user): void
@@ -248,5 +389,67 @@ final class Request
     public function all(): array
     {
         return $this->payload;
+    }
+
+    /** @return array<string, mixed>|null */
+    private function parseMultipartForm(string $body): ?array
+    {
+        $contentType = $this->header('content-type');
+
+        if (!is_string($contentType) || !preg_match('/boundary=(?:"([^"]+)"|([^;]+))/i', $contentType, $matches)) {
+            return null;
+        }
+
+        $boundary = $matches[1] !== '' ? $matches[1] : trim($matches[2]);
+
+        if ($boundary === '') {
+            return null;
+        }
+
+        $pairs = [];
+        $parts = explode('--' . $boundary, $body);
+
+        foreach ($parts as $part) {
+            $part = ltrim($part, "\r\n");
+            $part = rtrim($part, "\r\n");
+
+            if ($part === '' || $part === '--') {
+                continue;
+            }
+
+            $segments = preg_split("/\r?\n\r?\n/", $part, 2);
+
+            if (!is_array($segments) || count($segments) !== 2) {
+                continue;
+            }
+
+            [$rawHeaders, $value] = $segments;
+            $disposition = null;
+
+            foreach (preg_split("/\r?\n/", $rawHeaders) ?: [] as $line) {
+                if (str_starts_with(strtolower($line), 'content-disposition:')) {
+                    $disposition = trim(substr($line, strlen('content-disposition:')));
+                    break;
+                }
+            }
+
+            if (!is_string($disposition) || !preg_match('/name="([^"]+)"/', $disposition, $nameMatch)) {
+                continue;
+            }
+
+            if (preg_match('/filename="[^"]*"/', $disposition) === 1) {
+                continue;
+            }
+
+            $pairs[] = rawurlencode($nameMatch[1]) . '=' . rawurlencode($value);
+        }
+
+        if ($pairs === []) {
+            return null;
+        }
+
+        parse_str(implode('&', $pairs), $parsed);
+
+        return is_array($parsed) ? $parsed : null;
     }
 }

@@ -38,6 +38,7 @@ Or with the example app:
 - Gzip and Brotli response compression
 - Trusted proxy support (`FIUM_TRUSTED_PROXIES`)
 - Configurable request timeouts and body size limits
+- Request bodies are streamed to temp files for PHP workers instead of being fully buffered in memory
 - Structured logging with JSON format option
 - Health endpoint (`/health`) with JSON worker statistics
 - Prometheus-compatible metrics (`/_fium/metrics`)
@@ -48,9 +49,13 @@ Or with the example app:
 - Concise route format: `'GET /path' => handler`
 - Closure-based inline handlers and class-based handlers
 - Route groups with shared prefix and middleware
+- Explicit route name overrides in concise route definitions
 - Named route URL generation (`Application::url()`)
+- Named middleware groups via top-level `middleware_groups`
+- Request helpers for JSON and HTML form input, plus CSRF hidden-field rendering
+- Built-in registration, login, logout, refresh, password-reset, and email-verification handlers for session and bearer auth flows
 - Middleware pipeline: session, auth, CSRF, CORS, rate limiting, security headers, role guards, bearer tokens
-- Session storage: file-backed or PDO-backed
+- Session storage: file-backed or PDO-backed, with session ID rotation, flash data, and remember-me support
 - User storage: file-backed or PDO-backed
 - Config class with `.env` file loading
 - Input validation with common rules

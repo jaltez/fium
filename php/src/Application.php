@@ -35,6 +35,9 @@ final class Application
     /** @var array<string, class-string<Middleware>> */
     private array $middlewareAliases;
 
+    /** @var array<string, list<string>> */
+    private array $middlewareGroups;
+
     /** @var array<string, Middleware> singleton middleware instances keyed by alias */
     private array $middlewareCache = [];
 
@@ -49,6 +52,7 @@ final class Application
         $this->handlers = [];
         $this->routeMap = [];
         $this->baseDir = $baseDir;
+        $this->middlewareGroups = [];
         $this->middlewareAliases = [
             'add-powered-by' => AddPoweredByHeader::class,
             'auth-bearer' => AuthenticateBearer::class,
@@ -71,10 +75,15 @@ final class Application
         ];
         $this->debug = self::resolveDebugMode();
 
+        if (array_key_exists('middleware_groups', $rawRoutes)) {
+            $this->middlewareGroups = $this->normalizeMiddlewareGroups($rawRoutes['middleware_groups']);
+            unset($rawRoutes['middleware_groups']);
+        }
+
         // Extract global middleware if specified
         $globalMiddleware = [];
         if (isset($rawRoutes['middleware']) && is_array($rawRoutes['middleware'])) {
-            $globalMiddleware = $rawRoutes['middleware'];
+            $globalMiddleware = $this->expandMiddlewareList($rawRoutes['middleware']);
             unset($rawRoutes['middleware']);
         }
 
@@ -86,10 +95,8 @@ final class Application
         if ($userDriver === 'pdo') {
             $dsn = Config::get('FIUM_USER_DSN', 'sqlite:' . $this->baseDir . '/storage/users.db');
             $this->authenticator = Authenticator::fromStore(new Auth\PdoUserStore($dsn));
-        } elseif (is_file($usersFile)) {
-            $this->authenticator = Authenticator::fromFile($usersFile);
         } else {
-            $this->authenticator = Authenticator::empty();
+            $this->authenticator = Authenticator::fromFile($usersFile);
         }
         $this->tokenService = ApiTokenService::boot($this->authenticator);
 
@@ -216,7 +223,7 @@ final class Application
      * Parse routes from either concise or verbose format.
      *
      * Concise: 'GET /path' => fn(Request $r) => Response::json([...])
-     * Concise: 'GET /path' => ['middleware' => [...], 'handler' => fn(...) => ...]
+     * Concise: 'GET /path' => ['middleware' => [...], 'name' => 'route_name', 'handler' => fn(...) => ...]
      * Concise: 'GET /path' => 'App\\Handlers\\MyHandler'
      * Verbose: ['method' => 'GET', 'path' => '/', 'name' => '...', 'handler' => '...', 'middleware' => [...]]
      * Group:   'name' => ['prefix' => '/api', 'middleware' => [...], 'routes' => [...]]
@@ -234,7 +241,7 @@ final class Application
             } elseif (is_string($key) && is_array($value) && isset($value['routes'])) {
                 // Group: 'name' => ['prefix' => '/api', 'middleware' => [...], 'routes' => [...]]
                 $groupPrefix = $prefix . (string) ($value['prefix'] ?? '');
-                $groupMiddleware = array_merge($middleware, (array) ($value['middleware'] ?? []));
+                $groupMiddleware = $this->expandMiddlewareList(array_merge($middleware, (array) ($value['middleware'] ?? [])));
                 $this->parseRoutes($value['routes'], $groupPrefix, $groupMiddleware);
             } elseif (is_string($key)) {
                 // Concise format: 'METHOD /path' => handler
@@ -253,7 +260,7 @@ final class Application
     {
         $path = $prefix . (string) $route['path'];
         $name = (string) ($route['name'] ?? $this->generateRouteName($route['method'], $path));
-        $middleware = array_merge($groupMiddleware, (array) ($route['middleware'] ?? []));
+        $middleware = $this->expandMiddlewareList(array_merge($groupMiddleware, (array) ($route['middleware'] ?? [])));
         $handler = $route['handler'];
 
         $this->routeMap[$name] = [
@@ -278,20 +285,24 @@ final class Application
         [$method, $path] = $parts;
         $method = strtoupper($method);
         $path = $prefix . $path;
-        $name = $this->generateRouteName($method, $path);
-
         // value can be:
         // 1. Closure or callable  → handler with no middleware
         // 2. string (class name)  → handler with no middleware
-        // 3. array with 'handler' + optional 'middleware'
+        // 3. array with 'handler' + optional 'middleware' and 'name'
         if ($value instanceof \Closure || is_string($value)) {
             $handler = $value;
             $middleware = $groupMiddleware;
+            $name = $this->generateRouteName($method, $path);
         } elseif (is_array($value) && isset($value['handler'])) {
             $handler = $value['handler'];
-            $middleware = array_merge($groupMiddleware, (array) ($value['middleware'] ?? []));
+            $middleware = $this->expandMiddlewareList(array_merge($groupMiddleware, (array) ($value['middleware'] ?? [])));
+            $name = isset($value['name']) ? trim((string) $value['name']) : $this->generateRouteName($method, $path);
         } else {
             throw new \RuntimeException("Invalid handler for route '{$key}'.");
+        }
+
+        if ($name === '') {
+            throw new \RuntimeException("Invalid route name for route '{$key}'.");
         }
 
         $this->routeMap[$name] = [
@@ -327,6 +338,92 @@ final class Application
         }
 
         throw new \RuntimeException("Cannot resolve handler for route '{$routeName}'.");
+    }
+
+    /**
+     * @param mixed $groups
+     * @return array<string, list<string>>
+     */
+    private function normalizeMiddlewareGroups(mixed $groups): array
+    {
+        if (!is_array($groups)) {
+            throw new \RuntimeException('middleware_groups must be an array of named middleware lists.');
+        }
+
+        $normalized = [];
+
+        foreach ($groups as $name => $aliases) {
+            $name = is_string($name) ? trim($name) : '';
+
+            if ($name === '') {
+                throw new \RuntimeException('Middleware group names must be non-empty strings.');
+            }
+
+            if (str_contains($name, ':')) {
+                throw new \RuntimeException("Middleware group '{$name}' cannot contain ':'.");
+            }
+
+            if (array_key_exists($name, $this->middlewareAliases)) {
+                throw new \RuntimeException("Middleware group '{$name}' conflicts with a built-in middleware alias.");
+            }
+
+            if (!is_array($aliases)) {
+                throw new \RuntimeException("Middleware group '{$name}' must be a list of middleware aliases.");
+            }
+
+            $normalized[$name] = [];
+
+            foreach ($aliases as $alias) {
+                if (!is_string($alias)) {
+                    throw new \RuntimeException("Middleware group '{$name}' may only contain string aliases.");
+                }
+
+                $trimmed = trim($alias);
+
+                if ($trimmed === '') {
+                    throw new \RuntimeException("Middleware group '{$name}' may not contain empty aliases.");
+                }
+
+                $normalized[$name][] = $trimmed;
+            }
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * @param list<string> $middleware
+     * @param list<string> $stack
+     * @return list<string>
+     */
+    private function expandMiddlewareList(array $middleware, array $stack = []): array
+    {
+        $expanded = [];
+
+        foreach ($middleware as $alias) {
+            $alias = trim((string) $alias);
+
+            if ($alias === '') {
+                throw new \RuntimeException('Middleware aliases must be non-empty strings.');
+            }
+
+            if (isset($this->middlewareGroups[$alias])) {
+                if (in_array($alias, $stack, true)) {
+                    $chain = implode(' -> ', array_merge($stack, [$alias]));
+                    throw new \RuntimeException("Circular middleware group reference detected: {$chain}.");
+                }
+
+                $expanded = array_merge(
+                    $expanded,
+                    $this->expandMiddlewareList($this->middlewareGroups[$alias], array_merge($stack, [$alias]))
+                );
+                continue;
+            }
+
+            $expanded[] = $alias;
+        }
+
+        return $expanded;
     }
 
     private static function resolveDebugMode(): bool

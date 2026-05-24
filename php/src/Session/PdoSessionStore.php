@@ -60,6 +60,12 @@ final class PdoSessionStore extends AbstractSessionStore
         ]);
     }
 
+    public function delete(string $sessionId): void
+    {
+        $stmt = $this->pdo->prepare('DELETE FROM sessions WHERE id = :id');
+        $stmt->execute(['id' => $sessionId]);
+    }
+
     private function ensureTable(): void
     {
         $this->pdo->exec(

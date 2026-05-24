@@ -35,6 +35,8 @@ pub struct WorkerRequest {
     pub cookies: CookieMap,
     pub route_params: BTreeMap<String, String>,
     pub body: Option<String>,
+    #[serde(default)]
+    pub body_file: Option<String>,
     pub scheme: String,
     pub host: String,
     pub client_ip: Option<String>,
