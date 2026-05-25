@@ -26,10 +26,7 @@ final class Application
 {
     private static ?self $instance = null;
 
-    /** @var array<string, callable|string> handler by route name */
-    private array $handlers;
-
-    /** @var array<string, array{method: string, path: string, name: string, middleware: list<string>, _chain?: callable(Request): Response}> */
+    /** @var array<string, array{method: string, path: string, name: string, middleware: list<string>, _chain: callable(Request): Response}> */
     private array $routeMap;
 
     /** @var array<string, class-string<Middleware>> */
@@ -49,7 +46,6 @@ final class Application
     /** @param array<mixed> $rawRoutes */
     private function __construct(array $rawRoutes, string $baseDir)
     {
-        $this->handlers = [];
         $this->routeMap = [];
         $this->baseDir = $baseDir;
         $this->middlewareGroups = [];
@@ -187,7 +183,7 @@ final class Application
         $routeName = isset($workerRequest['matched_route']) ? (string) $workerRequest['matched_route'] : '';
 
         try {
-            if ($routeName === '' || !isset($this->handlers[$routeName])) {
+            if ($routeName === '' || !isset($this->routeMap[$routeName])) {
                 return Response::json([
                     'ok' => false,
                     'error' => 'route_not_resolved',
@@ -200,15 +196,6 @@ final class Application
             $request->setAttribute('authenticator', $this->authenticator);
             $request->setAttribute('token_service', $this->tokenService);
             $request->setAttribute('base_dir', $this->baseDir);
-
-            // Compile middleware chain lazily on first hit per route, then reuse
-            if (!isset($route['_chain'])) {
-                $handler = $this->resolveHandler($routeName);
-                $this->routeMap[$routeName]['_chain'] = $this->compileChain(
-                    $route['middleware'] ?? [],
-                    $handler
-                );
-            }
 
             $chain = $this->routeMap[$routeName]['_chain'];
             $response = $chain($request);
@@ -258,18 +245,15 @@ final class Application
      */
     private function registerVerboseRoute(array $route, string $prefix = '', array $groupMiddleware = []): void
     {
-        $path = $prefix . (string) $route['path'];
-        $name = (string) ($route['name'] ?? $this->generateRouteName($route['method'], $path));
-        $middleware = $this->expandMiddlewareList(array_merge($groupMiddleware, (array) ($route['middleware'] ?? [])));
-        $handler = $route['handler'];
+        if (!isset($route['handler'])) {
+            throw new \RuntimeException('Verbose route definitions must include a handler.');
+        }
 
-        $this->routeMap[$name] = [
-            'method' => strtoupper((string) $route['method']),
-            'path' => $path,
-            'name' => $name,
-            'middleware' => $middleware,
-        ];
-        $this->handlers[$name] = $handler;
+        $method = strtoupper((string) $route['method']);
+        $path = $prefix . (string) $route['path'];
+        $name = (string) ($route['name'] ?? $this->generateRouteName($method, $path));
+        $middleware = $this->expandMiddlewareList(array_merge($groupMiddleware, (array) ($route['middleware'] ?? [])));
+        $this->registerRoute($method, $path, $name, $middleware, $route['handler']);
     }
 
     /**
@@ -305,13 +289,21 @@ final class Application
             throw new \RuntimeException("Invalid route name for route '{$key}'.");
         }
 
+        $this->registerRoute($method, $path, $name, $middleware, $handler);
+    }
+
+    /**
+     * @param list<string> $middleware
+     */
+    private function registerRoute(string $method, string $path, string $name, array $middleware, mixed $handlerDefinition): void
+    {
         $this->routeMap[$name] = [
             'method' => $method,
             'path' => $path,
             'name' => $name,
             'middleware' => $middleware,
+            '_chain' => $this->compileChain($middleware, $this->resolveHandlerDefinition($handlerDefinition)),
         ];
-        $this->handlers[$name] = $handler;
     }
 
     private function generateRouteName(string $method, string $path): string
@@ -325,10 +317,8 @@ final class Application
         return strtolower($method) . '_' . $slug;
     }
 
-    private function resolveHandler(string $routeName): callable
+    private function resolveHandlerDefinition(mixed $handler): callable
     {
-        $handler = $this->handlers[$routeName];
-
         if ($handler instanceof \Closure) {
             return $handler;
         }
@@ -337,7 +327,7 @@ final class Application
             return new $handler();
         }
 
-        throw new \RuntimeException("Cannot resolve handler for route '{$routeName}'.");
+        throw new \RuntimeException('Cannot resolve route handler.');
     }
 
     /**

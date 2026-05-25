@@ -39,13 +39,15 @@ final class FileSessionStore extends AbstractSessionStore
             throw new \RuntimeException(sprintf('Session directory "%s" could not be created.', $this->directory));
         }
 
-        $json = json_encode($session->all(), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        $json = json_encode($session->all(), JSON_UNESCAPED_SLASHES);
 
         if ($json === false) {
             throw new \RuntimeException('Failed to encode session data.');
         }
 
-        file_put_contents($this->pathFor($session->id()), $json . PHP_EOL, LOCK_EX);
+        if (file_put_contents($this->pathFor($session->id()), $json, LOCK_EX) === false) {
+            throw new \RuntimeException(sprintf('Session file "%s" could not be written.', $this->pathFor($session->id())));
+        }
     }
 
     public function delete(string $sessionId): void

@@ -32,13 +32,13 @@ Or with the example app:
 ## Features
 
 **Runtime (Rust)**
-- Worker pool with least-loaded dispatch, crash recovery, and max-request recycling
+- Supervised PHP worker pool with crash recovery and max-request recycling
 - TLS/HTTPS via `--tls-cert`/`--tls-key` or `--tls-self-signed` for development
 - Static file serving from a configurable directory
 - Gzip and Brotli response compression
 - Trusted proxy support (`FIUM_TRUSTED_PROXIES`)
 - Configurable request timeouts and body size limits
-- Request bodies are streamed to temp files for PHP workers instead of being fully buffered in memory
+- Request body size limits and runtime-managed request buffering for PHP workers
 - Structured logging with JSON format option
 - Health endpoint (`/health`) with JSON worker statistics
 - Prometheus-compatible metrics (`/_fium/metrics`)
@@ -53,7 +53,7 @@ Or with the example app:
 - Named route URL generation (`Application::url()`)
 - Named middleware groups via top-level `middleware_groups`
 - Request helpers for JSON and HTML form input, plus CSRF hidden-field rendering
-- Built-in registration, login, logout, refresh, password-reset, and email-verification handlers for session and bearer auth flows
+- Built-in session and bearer auth helpers, plus optional registration, login, logout, refresh, reset, and verification handlers
 - Middleware pipeline: session, auth, CSRF, CORS, rate limiting, security headers, role guards, bearer tokens
 - Session storage: file-backed or PDO-backed, with session ID rotation, flash data, and remember-me support
 - User storage: file-backed or PDO-backed

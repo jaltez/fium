@@ -4,7 +4,6 @@ use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
-    pub method: String,
     pub name: String,
     pub path: String,
     pub is_static: bool,
@@ -45,32 +44,16 @@ impl RouteTable {
                 split_segments_owned(&br.path)
             };
 
-            let methods = by_method.entry(br.method).or_default();
-            // Push static routes first so the fast-path hits early.
-            if is_static {
-                methods.insert(0, RouteEntry {
-                    method: String::new(), // filled below
-                    name: br.name,
-                    path: br.path,
-                    is_static,
-                    segments,
-                });
-            } else {
-                methods.push(RouteEntry {
-                    method: String::new(),
-                    name: br.name,
-                    path: br.path,
-                    is_static,
-                    segments,
-                });
-            }
+            by_method.entry(br.method).or_default().push(RouteEntry {
+                name: br.name,
+                path: br.path,
+                is_static,
+                segments,
+            });
         }
 
-        // Fill in the method field (won't compile without clone, do it after).
-        for (method, routes) in by_method.iter_mut() {
-            for route in routes.iter_mut() {
-                route.method = method.clone();
-            }
+        for routes in by_method.values_mut() {
+            routes.sort_by_key(|route| !route.is_static);
         }
 
         Ok(Self { by_method })
@@ -78,9 +61,10 @@ impl RouteTable {
 
     pub fn list(&self) -> Vec<(&str, &str, &str)> {
         let mut all: Vec<(&str, &str, &str)> = self.by_method
-            .values()
-            .flatten()
-            .map(|r| (r.method.as_str(), r.path.as_str(), r.name.as_str()))
+            .iter()
+            .flat_map(|(method, routes)| {
+                routes.iter().map(move |route| (method.as_str(), route.path.as_str(), route.name.as_str()))
+            })
             .collect();
         // Stable ordering for display.
         all.sort_by_key(|(_, _, name)| *name);
@@ -89,6 +73,7 @@ impl RouteTable {
 
     pub fn match_route(&self, method: &str, path: &str) -> Option<RouteMatch> {
         let candidates = self.by_method.get(method)?;
+        let mut actual_segments = None;
 
         // Fast path: exact match for static routes.
         for route in candidates {
@@ -102,8 +87,7 @@ impl RouteTable {
                 continue;
             }
 
-            // Parameterised route — split actual path segments and compare.
-            let actual_segments = split_segments(path);
+            let actual_segments = actual_segments.get_or_insert_with(|| split_segments(path));
             if actual_segments.len() != route.segments.len() {
                 continue;
             }

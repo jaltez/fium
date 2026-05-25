@@ -197,6 +197,12 @@ final class Request
         }
 
         $this->jsonParsed = true;
+        $contentType = $this->contentType();
+
+        if ($this->isFormContentType($contentType)) {
+            return null;
+        }
+
         $body = $this->body();
 
         if ($body === '') {
@@ -217,13 +223,17 @@ final class Request
         }
 
         $this->formParsed = true;
+        $contentType = $this->contentType();
+
+        if ($contentType !== 'application/x-www-form-urlencoded' && $contentType !== 'multipart/form-data') {
+            return null;
+        }
+
         $body = $this->body();
 
         if ($body === '') {
             return null;
         }
-
-        $contentType = $this->contentType();
 
         if ($contentType === 'application/x-www-form-urlencoded') {
             parse_str($body, $parsed);
@@ -243,6 +253,28 @@ final class Request
 
     public function input(string $key, mixed $default = null): mixed
     {
+        $contentType = $this->contentType();
+
+        if ($this->isFormContentType($contentType)) {
+            $form = $this->form();
+
+            if (is_array($form) && array_key_exists($key, $form)) {
+                return $form[$key];
+            }
+
+            return $default;
+        }
+
+        if ($this->isJsonContentType($contentType)) {
+            $json = $this->json();
+
+            if (is_array($json) && array_key_exists($key, $json)) {
+                return $json[$key];
+            }
+
+            return $default;
+        }
+
         $json = $this->json();
 
         if (is_array($json) && array_key_exists($key, $json)) {
@@ -451,5 +483,19 @@ final class Request
         parse_str(implode('&', $pairs), $parsed);
 
         return is_array($parsed) ? $parsed : null;
+    }
+
+    private function isFormContentType(?string $contentType): bool
+    {
+        return $contentType === 'application/x-www-form-urlencoded' || $contentType === 'multipart/form-data';
+    }
+
+    private function isJsonContentType(?string $contentType): bool
+    {
+        if (!is_string($contentType) || $contentType === '') {
+            return false;
+        }
+
+        return $contentType === 'application/json' || str_ends_with($contentType, '+json');
     }
 }
