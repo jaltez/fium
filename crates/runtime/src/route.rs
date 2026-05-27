@@ -3,17 +3,35 @@ use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
+enum RouteSegment {
+    Static(String),
+    Param(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct RouteEntry {
     pub name: String,
-    pub path: String,
-    pub is_static: bool,
-    pub segments: Vec<String>,
+    segments: Vec<RouteSegment>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MethodRoutes {
+    static_routes: HashMap<String, String>,
+    dynamic_routes: HashMap<usize, Vec<RouteEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct ListedRoute {
+    method: String,
+    path: String,
+    name: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct RouteTable {
     /// Routes keyed by HTTP method for O(1) lookup per method.
-    by_method: HashMap<String, Vec<RouteEntry>>,
+    by_method: HashMap<String, MethodRoutes>,
+    routes: Vec<ListedRoute>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,73 +52,78 @@ impl RouteTable {
             return Err(RouteError::EmptyBootRoutes);
         }
 
-        let mut by_method: HashMap<String, Vec<RouteEntry>> = HashMap::new();
+        let mut by_method: HashMap<String, MethodRoutes> = HashMap::new();
+        let mut routes = Vec::with_capacity(boot_routes.len());
 
         for br in boot_routes {
-            let is_static = !br.path.contains('{');
-            let segments = if is_static {
-                Vec::new() // static routes skip segment splitting
+            let method = br.method;
+            let path = br.path;
+            let name = br.name;
+            let method_routes = by_method.entry(method.clone()).or_default();
+
+            if is_static_path(&path) {
+                method_routes.static_routes.insert(path.clone(), name.clone());
             } else {
-                split_segments_owned(&br.path)
-            };
+                let segments = parse_segments_owned(&path);
+                method_routes
+                    .dynamic_routes
+                    .entry(segments.len())
+                    .or_default()
+                    .push(RouteEntry {
+                        name: name.clone(),
+                        segments,
+                    });
+            }
 
-            by_method.entry(br.method).or_default().push(RouteEntry {
-                name: br.name,
-                path: br.path,
-                is_static,
-                segments,
-            });
+            routes.push(ListedRoute { method, path, name });
         }
 
-        for routes in by_method.values_mut() {
-            routes.sort_by_key(|route| !route.is_static);
-        }
+        routes.sort_by(|left, right| left.name.cmp(&right.name));
 
-        Ok(Self { by_method })
+        Ok(Self { by_method, routes })
     }
 
     pub fn list(&self) -> Vec<(&str, &str, &str)> {
-        let mut all: Vec<(&str, &str, &str)> = self.by_method
+        self.routes
             .iter()
-            .flat_map(|(method, routes)| {
-                routes.iter().map(move |route| (method.as_str(), route.path.as_str(), route.name.as_str()))
+            .map(|route| {
+                (
+                    route.method.as_str(),
+                    route.path.as_str(),
+                    route.name.as_str(),
+                )
             })
-            .collect();
-        // Stable ordering for display.
-        all.sort_by_key(|(_, _, name)| *name);
-        all
+            .collect()
     }
 
     pub fn match_route(&self, method: &str, path: &str) -> Option<RouteMatch> {
-        let candidates = self.by_method.get(method)?;
-        let mut actual_segments = None;
+        let method_routes = self.by_method.get(method)?;
 
-        // Fast path: exact match for static routes.
+        if let Some(route_name) = method_routes.static_routes.get(path) {
+            return Some(RouteMatch {
+                route_name: route_name.clone(),
+                params: BTreeMap::new(),
+            });
+        }
+
+        let actual_segments = split_segments(path);
+        let candidates = method_routes.dynamic_routes.get(&actual_segments.len())?;
+
         for route in candidates {
-            if route.is_static {
-                if route.path == path {
-                    return Some(RouteMatch {
-                        route_name: route.name.clone(),
-                        params: BTreeMap::new(),
-                    });
-                }
-                continue;
-            }
-
-            let actual_segments = actual_segments.get_or_insert_with(|| split_segments(path));
-            if actual_segments.len() != route.segments.len() {
-                continue;
-            }
-
             let mut params = BTreeMap::new();
             let mut matched = true;
 
             for (pseg, aseg) in route.segments.iter().zip(actual_segments.iter()) {
-                if let Some(param_name) = extract_param_name(pseg) {
-                    params.insert(param_name.to_string(), (*aseg).to_string());
-                } else if pseg != aseg {
-                    matched = false;
-                    break;
+                match pseg {
+                    RouteSegment::Static(segment) => {
+                        if segment != aseg {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    RouteSegment::Param(param_name) => {
+                        params.insert(param_name.clone(), (*aseg).to_string());
+                    }
                 }
             }
 
@@ -127,7 +150,11 @@ fn split_segments(path: &str) -> Vec<&str> {
         .collect()
 }
 
-fn split_segments_owned(path: &str) -> Vec<String> {
+fn is_static_path(path: &str) -> bool {
+    !path.contains('{')
+}
+
+fn parse_segments_owned(path: &str) -> Vec<RouteSegment> {
     if path == "/" {
         return Vec::new();
     }
@@ -135,7 +162,10 @@ fn split_segments_owned(path: &str) -> Vec<String> {
     path.trim_matches('/')
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .map(ToString::to_string)
+        .map(|segment| match extract_param_name(segment) {
+            Some(param_name) => RouteSegment::Param(param_name.to_string()),
+            None => RouteSegment::Static(segment.to_string()),
+        })
         .collect()
 }
 
@@ -214,5 +244,21 @@ mod tests {
                 .route_name,
             "users_show"
         );
+    }
+
+    #[test]
+    fn prefers_dynamic_routes_with_matching_segment_count() {
+        let t = table(&[
+            ("GET", "/teams/{team}", "teams_show"),
+            ("GET", "/teams/{team}/members/{member}", "team_members_show"),
+        ]);
+
+        let matched = t
+            .match_route("GET", "/teams/core/members/javier")
+            .expect("four-segment route should match");
+
+        assert_eq!(matched.route_name, "team_members_show");
+        assert_eq!(matched.params.get("team").map(String::as_str), Some("core"));
+        assert_eq!(matched.params.get("member").map(String::as_str), Some("javier"));
     }
 }

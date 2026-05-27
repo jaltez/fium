@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-pub type HeaderMap = BTreeMap<String, Vec<String>>;
-pub type CookieMap = BTreeMap<String, String>;
+pub type HeaderMap = HashMap<String, Vec<String>>;
+pub type CookieMap = HashMap<String, String>;
 
 /// First message sent by the PHP worker after boot.
 /// Contains the route manifest so Rust can build its route table.

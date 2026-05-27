@@ -37,6 +37,7 @@ use worker::{RuntimeWorkerError, WorkerPool};
 const REQUEST_DURATION_BUCKETS: [f64; 13] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
+const MAX_IN_MEMORY_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Parser)]
 #[command(name = "fium", about = "Deno for PHP — a fast runtime for PHP applications")]
@@ -661,7 +662,14 @@ async fn dispatch(
     let (body, body_file) = if matches!(method.as_str(), "GET" | "HEAD") {
         (None, None)
     } else {
-        match stream_request_body_to_file(request.into_body(), body_max, &request_id).await {
+        match buffer_request_body(
+            request.into_body(),
+            body_max,
+            MAX_IN_MEMORY_REQUEST_BODY_BYTES,
+            &request_id,
+        )
+        .await
+        {
             Ok(result) => result,
             Err(response) => return response,
         }
@@ -759,14 +767,17 @@ async fn dispatch(
     }
 }
 
-async fn stream_request_body_to_file(
+async fn buffer_request_body(
     mut body: Body,
     body_max: usize,
+    in_memory_max: usize,
     request_id: &str,
 ) -> Result<(Option<String>, Option<String>), Response> {
     let mut total = 0usize;
+    let mut buffered = Vec::new();
     let mut temp_path: Option<PathBuf> = None;
     let mut temp_file: Option<File> = None;
+    let spill_threshold = body_max.min(in_memory_max);
 
     while let Some(frame_result) = body.frame().await {
         let frame = match frame_result {
@@ -792,6 +803,22 @@ async fn stream_request_body_to_file(
             return Err((StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response());
         }
 
+        if let Some(file) = &mut temp_file {
+            if let Err(error) = file.write_all(chunk.as_ref()).await {
+                error!(%error, %request_id, "failed to write streamed request body");
+                if let Some(path) = temp_path {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+            }
+            continue;
+        }
+
+        if buffered.len() + chunk.len() <= spill_threshold {
+            buffered.extend_from_slice(chunk.as_ref());
+            continue;
+        }
+
         if temp_file.is_none() {
             let path = std::env::temp_dir().join(format!("fium-body-{}.tmp", Uuid::new_v4()));
             let file = match File::create(&path).await {
@@ -806,7 +833,18 @@ async fn stream_request_body_to_file(
         }
 
         if let Some(file) = &mut temp_file {
-            if let Err(error) = file.write_all(&chunk).await {
+            if !buffered.is_empty() {
+                if let Err(error) = file.write_all(&buffered).await {
+                    error!(%error, %request_id, "failed to write streamed request body");
+                    if let Some(path) = temp_path {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+                }
+                buffered.clear();
+            }
+
+            if let Err(error) = file.write_all(chunk.as_ref()).await {
                 error!(%error, %request_id, "failed to write streamed request body");
                 if let Some(path) = temp_path {
                     let _ = tokio::fs::remove_file(path).await;
@@ -824,9 +862,42 @@ async fn stream_request_body_to_file(
             }
             return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
         }
+
+        return Ok((None, temp_path.map(|path| path.to_string_lossy().to_string())));
     }
 
-    Ok((None, temp_path.map(|path| path.to_string_lossy().to_string())))
+    if buffered.is_empty() {
+        return Ok((None, None));
+    }
+
+    match String::from_utf8(buffered) {
+        Ok(body) => Ok((Some(body), None)),
+        Err(error) => {
+            let bytes = error.into_bytes();
+            let path = std::env::temp_dir().join(format!("fium-body-{}.tmp", Uuid::new_v4()));
+            let mut file = match File::create(&path).await {
+                Ok(file) => file,
+                Err(error) => {
+                    error!(%error, %request_id, path = %path.display(), "failed to create request body temp file");
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+                }
+            };
+
+            if let Err(error) = file.write_all(&bytes).await {
+                error!(%error, %request_id, "failed to write streamed request body");
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+            }
+
+            if let Err(error) = file.flush().await {
+                error!(%error, %request_id, "failed to flush streamed request body");
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+            }
+
+            Ok((None, Some(path.to_string_lossy().to_string())))
+        }
+    }
 }
 
 fn init_project(directory: &PathBuf) -> anyhow::Result<()> {
@@ -1136,9 +1207,10 @@ fn parse_statm_rss_bytes(statm: &str, page_size: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_tcp_listener, encode_cookie_value, format_set_cookie, parse_statm_rss_bytes,
-        RequestDurationHistogram,
+        bind_tcp_listener, buffer_request_body, encode_cookie_value, format_set_cookie,
+        parse_statm_rss_bytes, RequestDurationHistogram, MAX_IN_MEMORY_REQUEST_BODY_BYTES,
     };
+    use axum::body::Body;
     use fium_transport::SetCookie;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tokio::time::Duration;
@@ -1196,5 +1268,84 @@ mod tests {
         .expect("listener should bind");
 
         assert!(listener.local_addr().is_ok());
+    }
+
+    #[tokio::test]
+    async fn buffer_request_body_keeps_small_utf8_payload_in_memory() {
+        let result = buffer_request_body(
+            Body::from("hello=fium"),
+            1024,
+            MAX_IN_MEMORY_REQUEST_BODY_BYTES,
+            "req_test_small",
+        )
+        .await;
+
+        let (body, body_file) = match result {
+            Ok(value) => value,
+            Err(_) => panic!("small request body should buffer in memory"),
+        };
+
+        assert_eq!(body.as_deref(), Some("hello=fium"));
+        assert!(body_file.is_none());
+    }
+
+    #[tokio::test]
+    async fn buffer_request_body_spills_large_payload_to_disk() {
+        let payload = "a".repeat(MAX_IN_MEMORY_REQUEST_BODY_BYTES + 1);
+        let result = buffer_request_body(
+            Body::from(payload.clone()),
+            payload.len() + 16,
+            MAX_IN_MEMORY_REQUEST_BODY_BYTES,
+            "req_test_large",
+        )
+        .await;
+
+        let (body, body_file) = match result {
+            Ok(value) => value,
+            Err(_) => panic!("large request body should spill to disk"),
+        };
+
+        assert!(body.is_none());
+
+        let body_file = match body_file {
+            Some(path) => path,
+            None => panic!("large request body should return a temp file path"),
+        };
+
+        let stored = tokio::fs::read_to_string(&body_file)
+            .await
+            .expect("temp file should be readable");
+        assert_eq!(stored, payload);
+        let _ = tokio::fs::remove_file(body_file).await;
+    }
+
+    #[tokio::test]
+    async fn buffer_request_body_spills_non_utf8_payload_to_disk() {
+        let payload = vec![0xf0, 0x28, 0x8c, 0x28];
+        let result = buffer_request_body(
+            Body::from(payload.clone()),
+            1024,
+            MAX_IN_MEMORY_REQUEST_BODY_BYTES,
+            "req_test_binary",
+        )
+        .await;
+
+        let (body, body_file) = match result {
+            Ok(value) => value,
+            Err(_) => panic!("non-UTF-8 request body should spill to disk"),
+        };
+
+        assert!(body.is_none());
+
+        let body_file = match body_file {
+            Some(path) => path,
+            None => panic!("non-UTF-8 request body should return a temp file path"),
+        };
+
+        let stored = tokio::fs::read(&body_file)
+            .await
+            .expect("temp file should be readable");
+        assert_eq!(stored, payload);
+        let _ = tokio::fs::remove_file(body_file).await;
     }
 }

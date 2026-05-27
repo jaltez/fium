@@ -36,7 +36,9 @@ final class StartSession implements Middleware
 
     public function handle(Request $request, callable $next): Response
     {
-        $session = $this->store->load($request->cookie(self::COOKIE_NAME));
+        $incomingSessionId = $request->cookie(self::COOKIE_NAME);
+        $session = $this->store->load($incomingSessionId);
+        $rememberedBefore = $session->remembers();
         $session->ageFlashData();
         $request->setSession($session);
 
@@ -46,23 +48,34 @@ final class StartSession implements Middleware
             $this->store->regenerate($session);
         }
 
-        if ($session->isDirty() || $session->isNew()) {
+        // Persist and resend the cookie only when request handling changed session state.
+        if ($session->isDirty()) {
             $previousId = $session->previousId();
             $this->store->save($session);
+            $shouldSetCookie = $incomingSessionId !== $session->id()
+                || $rememberedBefore !== $session->remembers();
+
             if ($previousId !== null) {
                 $this->store->delete($previousId);
                 $session->clearPreviousId();
+                $shouldSetCookie = true;
             }
+
+            if (!$shouldSetCookie) {
+                return $response;
+            }
+
+            return $response->withCookie(
+                self::COOKIE_NAME,
+                $session->id(),
+                '/',
+                true,
+                false,
+                'Lax',
+                $session->remembers() ? self::REMEMBER_ME_MAX_AGE : null,
+            );
         }
 
-        return $response->withCookie(
-            self::COOKIE_NAME,
-            $session->id(),
-            '/',
-            true,
-            false,
-            'Lax',
-            $session->remembers() ? self::REMEMBER_ME_MAX_AGE : null,
-        );
+        return $response;
     }
 }

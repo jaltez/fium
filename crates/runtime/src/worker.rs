@@ -625,10 +625,31 @@ impl WorkerSupervisor {
     }
 }
 
-/// A pool of PHP worker processes that distributes requests to the least-loaded worker.
+/// Choose between two sampled workers instead of scanning the full pool.
+fn choose_worker_index<F>(worker_count: usize, cursor: &AtomicUsize, pending_count: F) -> usize
+where
+    F: Fn(usize) -> usize,
+{
+    if worker_count <= 1 {
+        return 0;
+    }
+
+    let turn = cursor.fetch_add(1, Ordering::Relaxed);
+    let first = turn % worker_count;
+    let second = (first + (worker_count / 2).max(1)) % worker_count;
+
+    if pending_count(second) < pending_count(first) {
+        second
+    } else {
+        first
+    }
+}
+
+/// A pool of PHP worker processes that distributes requests with queue-aware sampling.
 #[derive(Clone)]
 pub struct WorkerPool {
     workers: Arc<Vec<WorkerSupervisor>>,
+    dispatch_cursor: Arc<AtomicUsize>,
 }
 
 impl WorkerPool {
@@ -658,6 +679,7 @@ impl WorkerPool {
 
         Self {
             workers: Arc::new(workers),
+            dispatch_cursor: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -728,13 +750,13 @@ impl WorkerPool {
         }
     }
 
-    /// Dispatch a request to the worker with the fewest in-flight requests.
+    /// Dispatch a request to one of two sampled workers, preferring the shorter queue.
     pub async fn handle(&self, request: WorkerRequest) -> Result<WorkerResponse, RuntimeWorkerError> {
-        let index = self.workers.iter()
-            .enumerate()
-            .min_by_key(|(_, w)| w.pending_count())
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let index = choose_worker_index(
+            self.workers.len(),
+            self.dispatch_cursor.as_ref(),
+            |worker_index| self.workers[worker_index].pending_count(),
+        );
 
         self.workers[index].handle(request).await
     }
@@ -863,5 +885,21 @@ mod tests {
             error,
             RuntimeWorkerError::ProtocolVersionMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn choose_worker_index_returns_zero_for_single_worker() {
+        let cursor = AtomicUsize::new(0);
+
+        assert_eq!(choose_worker_index(1, &cursor, |_| 0), 0);
+    }
+
+    #[test]
+    fn choose_worker_index_prefers_lower_pending_worker() {
+        let cursor = AtomicUsize::new(0);
+        let pending = [5, 1, 0, 3];
+
+        assert_eq!(choose_worker_index(pending.len(), &cursor, |index| pending[index]), 2);
+        assert_eq!(choose_worker_index(pending.len(), &cursor, |index| pending[index]), 1);
     }
 }
