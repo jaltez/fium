@@ -89,6 +89,30 @@ return [
     // Example: closure-based inline handler
     'GET /ping' => fn(Request $r) => Response::json(['pong' => true]),
 
+    // Cache demo: memoizes a value across requests within the worker process.
+    'GET /cache-demo' => function (Request $r): Response {
+        $cache = \Fium\Cache\CacheManager::driver();
+        $value = $cache->remember('cache-demo-key', function (): array {
+            return ['computed_at' => gmdate('c'), 'payload' => bin2hex(random_bytes(4))];
+        }, 60);
+
+        return Response::json(['cached' => $value]);
+    },
+
+    // Database demo: counts users when a DB is configured, degrades gracefully otherwise.
+    'GET /db-demo' => function (Request $r): Response {
+        try {
+            $count = \Fium\Database\Connection::table('users')->count();
+
+            return Response::json(['configured' => true, 'user_count' => $count]);
+        } catch (\Throwable $e) {
+            return Response::json([
+                'configured' => false,
+                'hint' => 'Set FIUM_DB_DSN to enable the database layer.',
+            ]);
+        }
+    },
+
     // HTML response example
     'GET /welcome' => fn(Request $r) => Response::html('<h1>Welcome to Fium</h1><p>Fast PHP runtime.</p>'),
 

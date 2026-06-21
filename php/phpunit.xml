@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         executionOrder="depends,defects"
+         requireCoverageMetadata="false"
+         beStrictAboutCoverageMetadata="false"
+         beStrictAboutOutputDuringTests="true"
+         displayDetailsOnTestsThatTriggerWarnings="true"
+         failOnRisky="true"
+         failOnWarning="true"
+         colors="true">
+
+    <testsuites>
+        <testsuite name="Fium framework">
+            <directory>tests</directory>
+        </testsuite>
+    </testsuites>
+
+    <source>
+        <include>
+            <directory>src</directory>
+        </include>
+    </source>
+
+    <php>
+        <!-- Isolate session/user storage during tests -->
+        <env name="FIUM_SESSION_DRIVER" value="file"/>
+        <env name="FIUM_USER_DRIVER" value="file"/>
+        <!-- Application::boot() constructs the API token service, which needs a signing secret. -->
+        <env name="FIUM_API_TOKEN_SECRET" value="fium-test-signing-secret-not-for-production-use-32+chars"/>
+    </php>
+
+</phpunit>

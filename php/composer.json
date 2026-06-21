@@ -1,13 +1,33 @@
 {
-  "name": "fium/framework",
-  "description": "PHP-side package scaffold for the Fium runtime experiment",
-  "type": "library",
-  "require": {
-    "php": "^8.2"
-  },
-  "autoload": {
-    "psr-4": {
-      "Fium\\": "src/"
+    "name": "fium/framework",
+    "description": "PHP-side package scaffold for the Fium runtime experiment",
+    "type": "library",
+    "license": "MIT OR Apache-2.0",
+    "require": {
+        "php": "^8.2",
+        "ext-json": "*",
+        "ext-mbstring": "*",
+        "ext-pdo": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "Fium\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Fium\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "test:coverage": "phpunit --coverage-text"
+    },
+    "config": {
+        "sort-packages": true,
+        "optimize-autoloader": true
     }
-  }
 }

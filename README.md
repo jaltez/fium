@@ -60,6 +60,9 @@ Or with the example app:
 - Config class with `.env` file loading
 - Input validation with common rules
 - JSON, HTML, text, redirect, and empty response types
+- Database layer: lazy PDO connection, fluent query builder, and active-record
+  `Model` (zero-dependency, parameter-bound, identifier-validated)
+- Cache layer: in-process, file-backed, or optional Redis (phpredis) drivers
 
 ## Configuration
 
@@ -160,3 +163,7 @@ Built-in middleware aliases:
 - [Middleware Guide](docs/middleware.md)
 - [Deployment Guide](docs/deployment.md)
 - [Protocol V1 Specification](docs/protocol-v1.md)
+- [Architecture](docs/architecture.md)
+- [PHP API Reference](docs/api-reference.md)
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build, test, and code-style guidance.
