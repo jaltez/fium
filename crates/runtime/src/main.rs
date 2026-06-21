@@ -606,6 +606,19 @@ async fn dispatch(
     span.record("method", tracing::field::display(&method));
     span.record("path", tracing::field::display(&path));
 
+    // World-B fast path: answer CORS preflights entirely from Rust. The boot manifest
+    // already tells us which static paths carry the `cors` middleware, so an OPTIONS
+    // request to such a path needs no PHP round-trip. This is gated behind
+    // FIUM_NATIVE_CORS so the same binary can run both the Before (PHP) and After
+    // (Rust) paths for measurement. With this off, an OPTIONS to a POST route still
+    // 404s at the route layer — i.e. CORS preflight is effectively broken today.
+    if state.config.native_cors_preflight && method == "OPTIONS" {
+        let serves_preflight = state.routes.load().cors_preflight_target(&path);
+        if serves_preflight {
+            return native_cors_preflight_response();
+        }
+    }
+
     let route_match = {
         let routes = state.routes.load();
         routes.match_route(&method, &path)
@@ -1136,6 +1149,48 @@ fn parse_cookies(headers: &axum::http::HeaderMap) -> CookieMap {
     cookies
 }
 
+/// Build a CORS preflight response entirely in Rust, mirroring the headers the PHP
+/// `Cors` middleware emits (same env vars, same defaults). Producing the same bytes
+/// means before/after measurements isolate the PHP round-trip cost, not the response.
+fn native_cors_preflight_response() -> Response {
+    fn env_or(key: &str, default: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| default.to_string())
+    }
+
+    let origin = env_or("FIUM_CORS_ORIGINS", "*");
+    let methods = env_or("FIUM_CORS_METHODS", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    let headers = env_or(
+        "FIUM_CORS_HEADERS",
+        "Content-Type, Authorization, Accept, X-Requested-With",
+    );
+    let max_age = env_or("FIUM_CORS_MAX_AGE", "86400");
+
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    let response_headers = response.headers_mut();
+    for (name, value) in [
+        (
+            axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            origin.as_str(),
+        ),
+        (
+            axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+            methods.as_str(),
+        ),
+        (
+            axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+            headers.as_str(),
+        ),
+        (axum::http::header::ACCESS_CONTROL_MAX_AGE, max_age.as_str()),
+    ] {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            response_headers.insert(name, value);
+        }
+    }
+
+    response
+}
+
 fn format_set_cookie(cookie: &SetCookie) -> String {
     let encoded_value = encode_cookie_value(&cookie.value);
     let mut header = format!("{}={}", cookie.name, encoded_value);
@@ -1208,7 +1263,8 @@ fn parse_statm_rss_bytes(statm: &str, page_size: u64) -> Option<u64> {
 mod tests {
     use super::{
         bind_tcp_listener, buffer_request_body, encode_cookie_value, format_set_cookie,
-        parse_statm_rss_bytes, RequestDurationHistogram, MAX_IN_MEMORY_REQUEST_BODY_BYTES,
+        native_cors_preflight_response, parse_statm_rss_bytes, RequestDurationHistogram,
+        MAX_IN_MEMORY_REQUEST_BODY_BYTES,
     };
     use axum::body::Body;
     use fium_transport::SetCookie;
@@ -1256,6 +1312,17 @@ mod tests {
     fn parse_statm_rss_bytes_parses_resident_pages() {
         assert_eq!(parse_statm_rss_bytes("100 25 0 0 0 0 0", 4096), Some(102_400));
         assert_eq!(parse_statm_rss_bytes("invalid", 4096), None);
+    }
+
+    #[test]
+    fn native_cors_preflight_response_emits_cors_headers() {
+        let response = native_cors_preflight_response();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        let headers = response.headers();
+        assert!(headers.contains_key("access-control-allow-origin"));
+        assert!(headers.contains_key("access-control-allow-methods"));
+        assert!(headers.contains_key("access-control-allow-headers"));
+        assert!(headers.contains_key("access-control-max-age"));
     }
 
     #[test]

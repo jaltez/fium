@@ -1,5 +1,5 @@
 use fium_transport::BootRoute;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -32,6 +32,9 @@ pub struct RouteTable {
     /// Routes keyed by HTTP method for O(1) lookup per method.
     by_method: HashMap<String, MethodRoutes>,
     routes: Vec<ListedRoute>,
+    /// Static paths that carry the `cors` middleware, so Rust can answer
+    /// OPTIONS preflights itself without a PHP round-trip.
+    cors_paths: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,12 +57,18 @@ impl RouteTable {
 
         let mut by_method: HashMap<String, MethodRoutes> = HashMap::new();
         let mut routes = Vec::with_capacity(boot_routes.len());
+        let mut cors_paths = HashSet::new();
 
         for br in boot_routes {
             let method = br.method;
             let path = br.path;
             let name = br.name;
             let method_routes = by_method.entry(method.clone()).or_default();
+
+            // Record static paths protected by CORS so preflights can be served from Rust.
+            if is_static_path(&path) && br.middleware.iter().any(|m| m == "cors") {
+                cors_paths.insert(path.clone());
+            }
 
             if is_static_path(&path) {
                 method_routes.static_routes.insert(path.clone(), name.clone());
@@ -80,7 +89,11 @@ impl RouteTable {
 
         routes.sort_by(|left, right| left.name.cmp(&right.name));
 
-        Ok(Self { by_method, routes })
+        Ok(Self {
+            by_method,
+            routes,
+            cors_paths,
+        })
     }
 
     pub fn list(&self) -> Vec<(&str, &str, &str)> {
@@ -137,6 +150,14 @@ impl RouteTable {
 
         None
     }
+
+    /// Whether `path` is a static route protected by the `cors` middleware, meaning
+    /// Rust can answer an OPTIONS preflight for it without dispatching to PHP.
+    /// Note: dynamic (parameterized) cors paths are not matched here yet — see
+    /// BENCHMARKS.md — so this is currently exact-path only.
+    pub fn cors_preflight_target(&self, path: &str) -> bool {
+        self.cors_paths.contains(path)
+    }
 }
 
 fn split_segments(path: &str) -> Vec<&str> {
@@ -189,6 +210,20 @@ mod tests {
                 path: (*path).to_string(),
                 name: (*name).to_string(),
                 middleware: Vec::new(),
+            })
+            .collect();
+
+        RouteTable::from_boot_routes(boot_routes).expect("route table should build")
+    }
+
+    fn table_with_middleware(routes: &[(&str, &str, &str, &[&str])]) -> RouteTable {
+        let boot_routes = routes
+            .iter()
+            .map(|(method, path, name, mw)| BootRoute {
+                method: (*method).to_string(),
+                path: (*path).to_string(),
+                name: (*name).to_string(),
+                middleware: mw.iter().map(|s| (*s).to_string()).collect(),
             })
             .collect();
 
@@ -260,5 +295,19 @@ mod tests {
         assert_eq!(matched.route_name, "team_members_show");
         assert_eq!(matched.params.get("team").map(String::as_str), Some("core"));
         assert_eq!(matched.params.get("member").map(String::as_str), Some("javier"));
+    }
+
+    #[test]
+    fn cors_preflight_target_only_for_cors_static_paths() {
+        let t = table_with_middleware(&[
+            ("POST", "/bench/cors", "bench_cors", &["cors"]),
+            ("GET", "/bench/plain", "bench_plain", &[]),
+            ("POST", "/api/{id}", "api_dynamic", &["cors"]),
+        ]);
+
+        assert!(t.cors_preflight_target("/bench/cors"));
+        assert!(!t.cors_preflight_target("/bench/plain"));
+        // Dynamic cors paths are not yet matched (documented limitation).
+        assert!(!t.cors_preflight_target("/api/42"));
     }
 }

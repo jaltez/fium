@@ -29,6 +29,10 @@ pub struct RuntimeConfig {
 
     // Trusted proxies (cached from env at startup)
     pub trusted_proxies: TrustedProxies,
+
+    // World-B fast-path toggles: serve select middleware from Rust so the request
+    // never crosses into PHP. Env-only for now (`fium.toml` plumbing can follow).
+    pub native_cors_preflight: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +159,14 @@ fn default_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
+}
+
+/// Read a boolean env var: true for 1/true/yes/on (case-insensitive), else false.
+fn native_bool(key: &str) -> bool {
+    matches!(
+        std::env::var(key).unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn parse_size(s: &str) -> Option<usize> {
@@ -291,6 +303,7 @@ impl RuntimeConfig {
             static_dir: None,
             static_enabled: false,
             trusted_proxies: TrustedProxies::from_env(),
+            native_cors_preflight: native_bool("FIUM_NATIVE_CORS"),
         }
     }
 
@@ -375,6 +388,7 @@ impl RuntimeConfig {
                 .enabled
                 .unwrap_or(defaults.static_enabled),
             trusted_proxies: defaults.trusted_proxies,
+            native_cors_preflight: defaults.native_cors_preflight,
         }
     }
 
@@ -502,6 +516,7 @@ mod tests {
             static_dir: None,
             static_enabled: false,
             trusted_proxies: TrustedProxies::None,
+            native_cors_preflight: false,
         };
 
         let toml = TomlConfig {
