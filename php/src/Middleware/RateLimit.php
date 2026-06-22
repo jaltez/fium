@@ -29,6 +29,14 @@ final class RateLimit implements Middleware
 
     public function handle(Request $request, callable $next): Response
     {
+        // When the Rust runtime enforces rate limits natively (FIUM_NATIVE_RATELIMIT),
+        // defer to it: Rust's counters are coherent across the whole worker pool, so
+        // this per-worker limiter would otherwise both double-count and drift
+        // (the documented ratelimit x N behavior).
+        if (\Fium\Config::bool('FIUM_NATIVE_RATELIMIT')) {
+            return $next($request);
+        }
+
         $ip = $request->clientIp() ?? 'unknown';
         $now = time();
 

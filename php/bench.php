@@ -20,6 +20,22 @@ return [
         'handler' => fn(Request $r) => Response::json(['created' => true]),
     ],
 
+    // Rate-limit coherence probe: limit 60/min. With N workers:
+    //   FIUM_NATIVE_RATELIMIT=0 (Before) -> per-worker limit -> ~60xN allowed (incoherent).
+    //   FIUM_NATIVE_RATELIMIT=1 (After)  -> Rust pool-wide  -> exactly 60 allowed, then 429.
+    'GET /bench/limited' => [
+        'middleware' => ['ratelimit:60'],
+        'handler' => fn(Request $r) => Response::json(['ok' => true]),
+    ],
+
+    // Flood probe: limit 1/min. After the first allowed request the rest are 429s —
+    // served by PHP (Before) or by Rust (After). Used to measure rejection throughput
+    // and to prove the PHP pool is protected under a flood (requests_total stays flat).
+    'GET /bench/flood' => [
+        'middleware' => ['ratelimit:1'],
+        'handler' => fn(Request $r) => Response::json(['ok' => true]),
+    ],
+
     // Workload "preflight" — the PHP path (Before). Only reached when FIUM_NATIVE_CORS=0.
     // Produces the same 204 + CORS headers as the Rust path so the comparison isolates
     // *who serves it*, not *what is served*.

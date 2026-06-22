@@ -1,3 +1,4 @@
+use crate::ratelimit::{parse_rate_limit_alias, RateLimitConfig};
 use fium_transport::BootRoute;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
@@ -35,6 +36,9 @@ pub struct RouteTable {
     /// Static paths that carry the `cors` middleware, so Rust can answer
     /// OPTIONS preflights itself without a PHP round-trip.
     cors_paths: HashSet<String>,
+    /// Routes that declare a `ratelimit` directive, with the parsed config, so Rust
+    /// can enforce the limit pool-wide without a PHP round-trip.
+    rate_limits: HashMap<String, RateLimitConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +62,7 @@ impl RouteTable {
         let mut by_method: HashMap<String, MethodRoutes> = HashMap::new();
         let mut routes = Vec::with_capacity(boot_routes.len());
         let mut cors_paths = HashSet::new();
+        let mut rate_limits = HashMap::new();
 
         for br in boot_routes {
             let method = br.method;
@@ -68,6 +73,11 @@ impl RouteTable {
             // Record static paths protected by CORS so preflights can be served from Rust.
             if is_static_path(&path) && br.middleware.iter().any(|m| m == "cors") {
                 cors_paths.insert(path.clone());
+            }
+
+            // Parse the first ratelimit directive on the route, if any.
+            if let Some(alias) = br.middleware.iter().find_map(|m| parse_rate_limit_alias(m.as_str())) {
+                rate_limits.insert(name.clone(), alias);
             }
 
             if is_static_path(&path) {
@@ -93,6 +103,7 @@ impl RouteTable {
             by_method,
             routes,
             cors_paths,
+            rate_limits,
         })
     }
 
@@ -157,6 +168,12 @@ impl RouteTable {
     /// BENCHMARKS.md — so this is currently exact-path only.
     pub fn cors_preflight_target(&self, path: &str) -> bool {
         self.cors_paths.contains(path)
+    }
+
+    /// The rate-limit directive declared on `route_name`, if any, so Rust can enforce
+    /// it pool-wide without dispatching to PHP.
+    pub fn rate_limit_for(&self, route_name: &str) -> Option<&RateLimitConfig> {
+        self.rate_limits.get(route_name)
     }
 }
 
@@ -309,5 +326,24 @@ mod tests {
         assert!(!t.cors_preflight_target("/bench/plain"));
         // Dynamic cors paths are not yet matched (documented limitation).
         assert!(!t.cors_preflight_target("/api/42"));
+    }
+
+    #[test]
+    fn rate_limit_for_parses_directive_from_middleware() {
+        let t = table_with_middleware(&[
+            ("GET", "/bench/limited", "limited", &["ratelimit:60"]),
+            ("GET", "/bench/flood", "flood", &["ratelimit:1,10"]),
+            ("GET", "/bench/open", "open", &[]),
+        ]);
+
+        let limited = t.rate_limit_for("limited").expect("limited route has a directive");
+        assert_eq!(limited.max, 60);
+        assert_eq!(limited.window, std::time::Duration::from_secs(60));
+
+        let flood = t.rate_limit_for("flood").expect("flood route has a directive");
+        assert_eq!(flood.max, 1);
+        assert_eq!(flood.window, std::time::Duration::from_secs(10));
+
+        assert!(t.rate_limit_for("open").is_none());
     }
 }

@@ -1,5 +1,6 @@
 mod config;
 mod embed;
+mod ratelimit;
 mod route;
 mod worker;
 
@@ -17,6 +18,7 @@ use config::{CompressionConfig, LogFormat, RuntimeConfig};
 use fium_transport::{CookieMap, HeaderMap, SetCookie, WorkerRequest, PROTOCOL_VERSION};
 use http_body_util::BodyExt;
 use route::RouteTable;
+use ratelimit::{Allow, RateLimiter};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     net::SocketAddr,
@@ -107,6 +109,7 @@ struct AppState {
     config: Arc<RuntimeConfig>,
     start_time: Instant,
     request_latency: Arc<RequestDurationHistogram>,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 #[derive(Debug, Default)]
@@ -292,6 +295,7 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
         config: config.clone(),
         start_time: Instant::now(),
         request_latency: Arc::new(RequestDurationHistogram::new()),
+        rate_limiter: Arc::new(RateLimiter::new()),
     };
 
     let app = build_router(state, &config);
@@ -666,6 +670,28 @@ async fn dispatch(
     } else {
         addr.ip().to_string()
     };
+
+    // World-B fast path: enforce rate limits in Rust with pool-wide counters.
+    // Coherent across all workers (fixes the per-worker ratelimit x N behavior), and
+    // rejections are served as 429 without a PHP round-trip — so a flood to a limited
+    // route can no longer load the PHP pool. Gated by FIUM_NATIVE_RATELIMIT. When
+    // allowed, we carry the limit/remaining onto the response headers below.
+    let mut rate_limit_headers: Option<(u32, u32)> = None;
+    if state.config.native_rate_limit {
+        if let Some(cfg) = state.routes.load().rate_limit_for(route_name) {
+            match state.rate_limiter.check(route_name, &client_ip, cfg) {
+                Allow::Denied { retry_after_secs } => {
+                    let elapsed = start.elapsed();
+                    state.request_latency.record(elapsed);
+                    return rate_limit_denied_response(retry_after_secs);
+                }
+                Allow::Allowed { limit, remaining } => {
+                    rate_limit_headers = Some((limit, remaining));
+                }
+            }
+        }
+    }
+
     let is_secure = scheme == "https";
     let headers = normalize_headers(request.headers());
     let cookies = parse_cookies(request.headers());
@@ -752,6 +778,23 @@ async fn dispatch(
                     response
                         .headers_mut()
                         .append(axum::http::header::SET_COOKIE, value);
+                }
+            }
+
+            // Native rate limit (allowed path): stamp the limit/remaining headers that
+            // the PHP middleware would have added.
+            if let Some((limit, remaining)) = rate_limit_headers {
+                if let Ok(value) = HeaderValue::from_str(&limit.to_string()) {
+                    response.headers_mut().insert(
+                        axum::http::header::HeaderName::from_static("x-ratelimit-limit"),
+                        value,
+                    );
+                }
+                if let Ok(value) = HeaderValue::from_str(&remaining.to_string()) {
+                    response.headers_mut().insert(
+                        axum::http::header::HeaderName::from_static("x-ratelimit-remaining"),
+                        value,
+                    );
                 }
             }
 
@@ -999,6 +1042,7 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
         config: config.clone(),
         start_time: Instant::now(),
         request_latency: Arc::new(RequestDurationHistogram::new()),
+        rate_limiter: Arc::new(RateLimiter::new()),
     };
 
     let app = build_router(state, &config);
@@ -1152,6 +1196,12 @@ fn parse_cookies(headers: &axum::http::HeaderMap) -> CookieMap {
 /// Build a CORS preflight response entirely in Rust, mirroring the headers the PHP
 /// `Cors` middleware emits (same env vars, same defaults). Producing the same bytes
 /// means before/after measurements isolate the PHP round-trip cost, not the response.
+///
+/// TODO(world-b prod-readiness): this reads the *process* env (`std::env::var`), but PHP's
+/// `Cors` reads the app's `.env` via `Config::loadEnv`. A user who sets FIUM_CORS_ORIGINS
+/// in `.env` gets it applied by PHP but IGNORED here — so native CORS would serve `*` for a
+/// configured single-origin policy. Resolve by threading CORS config through RuntimeConfig
+/// or the boot manifest before flipping FIUM_NATIVE_CORS on by default.
 fn native_cors_preflight_response() -> Response {
     fn env_or(key: &str, default: &str) -> String {
         std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -1188,6 +1238,25 @@ fn native_cors_preflight_response() -> Response {
         }
     }
 
+    response
+}
+
+/// Build a 429 rate-limit-exceeded response in Rust, mirroring the PHP `RateLimit`
+/// middleware: JSON body, `Retry-After` header, no X-RateLimit headers (those only
+/// appear on allowed responses).
+fn rate_limit_denied_response(retry_after_secs: u64) -> Response {
+    let mut response = Response::new(Body::from(
+        r#"{"ok":false,"error":"rate_limit_exceeded"}"#,
+    ));
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        headers.insert(axum::http::header::RETRY_AFTER, value);
+    }
     response
 }
 
@@ -1263,8 +1332,8 @@ fn parse_statm_rss_bytes(statm: &str, page_size: u64) -> Option<u64> {
 mod tests {
     use super::{
         bind_tcp_listener, buffer_request_body, encode_cookie_value, format_set_cookie,
-        native_cors_preflight_response, parse_statm_rss_bytes, RequestDurationHistogram,
-        MAX_IN_MEMORY_REQUEST_BODY_BYTES,
+        native_cors_preflight_response, parse_statm_rss_bytes, rate_limit_denied_response,
+        RequestDurationHistogram, MAX_IN_MEMORY_REQUEST_BODY_BYTES,
     };
     use axum::body::Body;
     use fium_transport::SetCookie;
@@ -1323,6 +1392,18 @@ mod tests {
         assert!(headers.contains_key("access-control-allow-methods"));
         assert!(headers.contains_key("access-control-allow-headers"));
         assert!(headers.contains_key("access-control-max-age"));
+    }
+
+    #[test]
+    fn rate_limit_denied_response_shape() {
+        let response = rate_limit_denied_response(42);
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("42")
+        );
+        // X-RateLimit headers are only on allowed responses, not on 429.
+        assert!(!response.headers().contains_key("x-ratelimit-remaining"));
     }
 
     #[test]

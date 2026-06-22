@@ -33,6 +33,7 @@ pub struct RuntimeConfig {
     // World-B fast-path toggles: serve select middleware from Rust so the request
     // never crosses into PHP. Env-only for now (`fium.toml` plumbing can follow).
     pub native_cors_preflight: bool,
+    pub native_rate_limit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +305,7 @@ impl RuntimeConfig {
             static_enabled: false,
             trusted_proxies: TrustedProxies::from_env(),
             native_cors_preflight: native_bool("FIUM_NATIVE_CORS"),
+            native_rate_limit: native_bool("FIUM_NATIVE_RATELIMIT"),
         }
     }
 
@@ -389,6 +391,7 @@ impl RuntimeConfig {
                 .unwrap_or(defaults.static_enabled),
             trusted_proxies: defaults.trusted_proxies,
             native_cors_preflight: defaults.native_cors_preflight,
+            native_rate_limit: defaults.native_rate_limit,
         }
     }
 
@@ -517,6 +520,7 @@ mod tests {
             static_enabled: false,
             trusted_proxies: TrustedProxies::None,
             native_cors_preflight: false,
+            native_rate_limit: false,
         };
 
         let toml = TomlConfig {

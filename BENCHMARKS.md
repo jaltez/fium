@@ -108,3 +108,109 @@ FIUM_REQUESTS=20000 FIUM_CONCURRENCY=32 scripts/bench-native-cors.sh
    behavior) and is the same kind of win this benchmark demonstrates.
 3. **Hybrid middleware engine** — built-in middleware run in Rust (fast path); user-written
    middleware still runs in PHP, crossing the boundary only when present.
+
+---
+
+# World-B step 3: native rate limiting
+
+Rate limiting is the strongest case for moving a *stateful* middleware into Rust, because it
+stacks three wins at once: a correctness fix, an availability guarantee, and a speed delta —
+all from the same change.
+
+The PHP `RateLimit` middleware keeps its counters in process-local memory, so with `N`
+workers the configured limit is enforced `N` times (documented at `docs/middleware.md`). Worse,
+a rejected request still costs a full PHP round-trip, so **a flood to a rate-limited route
+loads the PHP pool** — the opposite of what rate limiting is for. Moving enforcement into the
+one Rust process that owns the pool fixes both: counters are coherent across workers, and
+`429`s are served without touching PHP.
+
+## Setup
+
+- **Workloads** (`php/bench.php`):
+  - `GET /bench/limited` (`ratelimit:60`) — coherence probe.
+  - `GET /bench/flood` (`ratelimit:1`) — rejection-throughput + pool-protection probe.
+- **Toggle**: `FIUM_NATIVE_RATELIMIT` (`config.rs`). The PHP middleware defers to Rust when
+  this is set (`RateLimit.php`), so the two paths don't double-count. Same release binary,
+  same `--workers 4`.
+- **Harness**: `scripts/bench-native-ratelimit.sh`.
+- **Limiter**: `ratelimit.rs` — a `Mutex<HashMap<(route, ip), Bucket>>`, keyed per route+IP
+  (an intentional improvement over the PHP middleware's per-IP-only keying, which shared one
+  counter across routes with different limits). Unlike the CORS spike, lookups are by route
+  name, so **dynamic/parameterized routes are fully supported** — no static-path limitation.
+
+## Results (stable across runs; coherence is deterministic)
+
+**Coherence** — 80 requests to `ratelimit:60` from one IP, 4 workers:
+
+| Mode | 200 | 429 | Effective limit |
+|---|---:|---:|---|
+| PHP (per-worker) | 80 | 0 | ~240 (= 60 × 4) — **broken** |
+| Rust (pool-wide) | **60** | **20** | exactly 60 — as configured |
+
+**Rejection throughput + pool protection** — flood `ratelimit:1`, 8000 reqs, concurrency 16:
+
+| Mode | RPS | p50 (ms) | p99 (ms) | PHP hits |
+|---|---:|---:|---:|---:|
+| PHP (429 via PHP) | 41,500 | 0.38 | 0.69 | **8000** |
+| Rust (429 via Rust) | **328,000** | **0.036** | **0.15** | **1** |
+
+- **~8× higher rejection throughput** (41.5k → 328k req/s).
+- **`php_hits`: 8000 → 1.** Under an 8000-request flood to a rate-limited route, PHP handles
+  **one** request in Rust mode vs **eight thousand** in PHP mode. The rate limiter only
+  actually protects the PHP pool when Rust enforces it — this is the headline result.
+- **Exact enforcement**: the configured limit is honored precisely regardless of worker count.
+
+## Interpretation
+
+This is the same IPC tax the CORS benchmark isolated (~0.39ms/PHP round-trip), now applied to
+the rejection path — but the more important numbers are the non-speed ones. Coherence makes
+`ratelimit:60` mean 60, not 60×N. And `php_hits=1` under an 8000-request flood is the
+availability argument: native rate limiting turns a denial-of-service vector (a flood to any
+limited endpoint) into a few hundred microseconds of Rust work with the PHP pool idle.
+
+It also de-risks step 4 (the hybrid middleware engine): the `Mutex<HashMap>` shared-state
+pattern holds up under concurrency — the `-c 16` flood allows exactly one request through,
+proving the lock serializes the check correctly across simultaneous connections.
+
+## Limitations
+
+1. **In-memory only.** Counters live in the Rust process; they don't survive a restart and
+   aren't shared across multiple Fium instances behind a load balancer. A Redis/shared backend
+   is the production story for multi-instance deployments (same gap the PHP version has).
+2. **Fixed window.** Matches the PHP middleware's fixed-window algorithm; no sliding window.
+3. **Per-(route, IP) keying** differs from the PHP per-IP-only keying (deliberate — see above).
+4. **`ab` caveats** as in the CORS section.
+
+## Production-readiness blockers (before either native toggle defaults on)
+
+Tracked from code review. Both toggles ship **off by default**, so these are latent, not live.
+
+- **[blocker] CORS `.env` divergence** (`main.rs::native_cors_preflight_response`) — Rust reads
+  process env; PHP reads the app `.env`. A `.env`-configured `FIUM_CORS_ORIGINS` is ignored by
+  native CORS, which would then serve `*` for a single-origin policy. Resolve via RuntimeConfig
+  or boot-manifest config plumbing. *(CORS spike, already committed.)*
+- **[fixed] Purge evicted non-expired buckets** (`ratelimit.rs`) — purge now uses each bucket's
+  own window, so long-window routes (e.g. `ratelimit:N,86400`) are no longer under-limited once
+  the map exceeds 4096 entries.
+- **[hardening] Single global `Mutex`** (`ratelimit.rs`) — serializes all checks; shard by IP
+  hash or move to a lock-free map under real load.
+- **[hardening] O(n) purge under the lock** — runs every check past the 4096 threshold; an
+  attacker churning IPs can contention-DoS the limiter. Use a periodic background sweep.
+- **[coverage] No automated dispatch integration tests** — the CORS 204, rate-limit 429, and
+  `X-RateLimit-*` header injection are exercised only manually. Extend `php_worker_e2e.rs` to
+  cover the native paths before default-on.
+
+## Reproduce
+
+```bash
+cargo build --release
+scripts/bench-native-ratelimit.sh
+```
+
+## World-B roadmap status
+
+1. ✅ **Benchmark + one Rust middleware** (CORS preflight — see above)
+2. ✅ **Stateful middleware into Rust** (rate-limit; session remains)
+3. ⬜ **Wire protocol** — binary over Unix socket / shared memory
+4. ⬜ **Hybrid middleware engine** — built-in middleware in Rust, user middleware in PHP
+5. ⬜ **Session into Rust** — same shared-state pattern as rate-limit, fixes session coherence
