@@ -30,15 +30,21 @@ if ($stdin === false || $stdout === false) {
     exit(1);
 }
 
+// Optional IPC profiling (FIUM_PROFILE). When enabled, each per-request stage is timed
+// with hrtime and cumulative means are written to stderr every 200 requests as
+// "PROFILE_PHP ...". Wire bytes are unchanged — this only splits raw I/O from
+// (de)serialization so each stage can be timed.
+$PROFILE = in_array(strtolower((string) getenv('FIUM_PROFILE')), ['1', 'true', 'yes', 'on'], true);
+$pAcc = ['n' => 0, 'read' => 0, 'decode' => 0, 'dispatch' => 0, 'encode' => 0, 'write' => 0];
+
 /**
- * Write a length-prefixed JSON frame to a stream.
- * Format: 4-byte big-endian u32 length, followed by the payload.
+ * Write a length-prefixed raw payload (bytes) to a stream.
+ * Format: 4-byte big-endian u32 length, followed by the payload bytes.
  */
-function write_frame($handle, string $payload): void
+function write_frame_raw($handle, string $payload): void
 {
     $len = strlen($payload);
-    $header = pack('N', $len);
-    $data = $header . $payload;
+    $data = pack('N', $len) . $payload;
     $remaining = strlen($data);
     $offset = 0;
     while ($remaining > 0) {
@@ -52,12 +58,11 @@ function write_frame($handle, string $payload): void
 }
 
 /**
- * Read a length-prefixed JSON frame from a stream.
- * Returns the decoded array, or null on EOF or malformed frame.
+ * Read a length-prefixed raw payload (bytes) from a stream.
+ * Returns the raw body string, or null on EOF / oversize frame.
  */
-function read_frame($handle): ?array
+function read_frame_raw($handle): ?string
 {
-    // Read 4-byte length header
     $header = '';
     while (strlen($header) < 4) {
         $chunk = fread($handle, 4 - strlen($header));
@@ -71,7 +76,6 @@ function read_frame($handle): ?array
     $len = $arr[1];
 
     if ($len > 16 * 1024 * 1024) {
-        // Frame too large — drain and return error
         return null;
     }
 
@@ -84,22 +88,47 @@ function read_frame($handle): ?array
         $body .= $chunk;
     }
 
-    return json_decode($body, true);
+    return $body;
 }
 
-// Boot protocol: send route manifest as first message
-write_frame($stdout, $application->bootManifest());
+function emit_profile_summary_if_due(): void
+{
+    global $PROFILE, $pAcc;
+    if (!$PROFILE || $pAcc['n'] === 0 || $pAcc['n'] % 200 !== 0) {
+        return;
+    }
+    $n = $pAcc['n'];
+    $mean = static function (int $total) use ($n): int {
+        return (int) ($total / $n);
+    };
+    fwrite(STDERR, sprintf(
+        "PROFILE_PHP n=%d read=%d decode=%d dispatch=%d encode=%d write=%d\n",
+        $n,
+        $mean($pAcc['read']),
+        $mean($pAcc['decode']),
+        $mean($pAcc['dispatch']),
+        $mean($pAcc['encode']),
+        $mean($pAcc['write'])
+    ));
+}
+
+// Boot protocol: send route manifest as the first frame.
+write_frame_raw($stdout, $application->bootManifest());
 fflush($stdout);
 
 while (true) {
-    $request = read_frame($stdin);
-
-    if ($request === null) {
+    $t0 = hrtime(true);
+    $raw = read_frame_raw($stdin);
+    $t1 = hrtime(true);
+    if ($raw === null) {
         break;
     }
 
+    $request = json_decode($raw, true);
+    $t2 = hrtime(true);
+
     if (!is_array($request)) {
-        write_frame($stdout, json_encode([
+        write_frame_raw($stdout, json_encode([
             'protocol_version' => 1,
             'request_id' => null,
             'status' => 500,
@@ -115,7 +144,7 @@ while (true) {
     // Validate protocol version before dispatching.
     $protocolVersion = isset($request['protocol_version']) ? (int) $request['protocol_version'] : 0;
     if ($protocolVersion !== 1) {
-        write_frame($stdout, json_encode([
+        write_frame_raw($stdout, json_encode([
             'protocol_version' => 1,
             'request_id' => $request['request_id'] ?? null,
             'status' => 500,
@@ -129,7 +158,22 @@ while (true) {
     }
 
     $response = $application->handleWorkerRequest($request);
+    $t3 = hrtime(true);
 
-    write_frame($stdout, json_encode($response, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    $payload = json_encode($response, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    $t4 = hrtime(true);
+
+    write_frame_raw($stdout, $payload);
     fflush($stdout);
+    $t5 = hrtime(true);
+
+    if ($PROFILE) {
+        $pAcc['n']++;
+        $pAcc['read'] += (int) ($t1 - $t0);
+        $pAcc['decode'] += (int) ($t2 - $t1);
+        $pAcc['dispatch'] += (int) ($t3 - $t2);
+        $pAcc['encode'] += (int) ($t4 - $t3);
+        $pAcc['write'] += (int) ($t5 - $t4);
+        emit_profile_summary_if_due();
+    }
 }

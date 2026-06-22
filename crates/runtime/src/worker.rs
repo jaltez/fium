@@ -11,11 +11,70 @@ use tracing::{info, warn};
 
 use std::{path::PathBuf, sync::Arc};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::route::{RouteError, RouteTable};
 
 /// Maximum frame size accepted from a PHP worker (16 MB).
 const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+
+// --- Optional IPC profiling (FIUM_PROFILE) -------------------------------------
+// When enabled, each per-request stage in `dispatch_transport` is timed and cumulative
+// means are logged every 200 requests (target `fium_profile`). Used by
+// scripts/profile-ipc.sh to decide whether serialization is the dominant IPC cost.
+static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn profile_enabled() -> bool {
+    *PROFILE_ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("FIUM_PROFILE").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+struct Profile {
+    encode_ns: AtomicU64,
+    write_ns: AtomicU64,
+    read_ns: AtomicU64,
+    decode_ns: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Profile {
+    const fn new() -> Self {
+        Self {
+            encode_ns: AtomicU64::new(0),
+            write_ns: AtomicU64::new(0),
+            read_ns: AtomicU64::new(0),
+            decode_ns: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, encode: Duration, write: Duration, read: Duration, decode: Duration) {
+        self.encode_ns.fetch_add(encode.as_nanos() as u64, Ordering::Relaxed);
+        self.write_ns.fetch_add(write.as_nanos() as u64, Ordering::Relaxed);
+        self.read_ns.fetch_add(read.as_nanos() as u64, Ordering::Relaxed);
+        self.decode_ns.fetch_add(decode.as_nanos() as u64, Ordering::Relaxed);
+        let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 200 == 0 {
+            let mean = |total: u64| total / n;
+            info!(
+                target: "fium_profile",
+                "PROFILE_RUST n={n} encode={}ns write={}ns read={}ns decode={}ns",
+                mean(self.encode_ns.load(Ordering::Relaxed)),
+                mean(self.write_ns.load(Ordering::Relaxed)),
+                mean(self.read_ns.load(Ordering::Relaxed)),
+                mean(self.decode_ns.load(Ordering::Relaxed)),
+            );
+        }
+    }
+}
+
+static PROFILE: Profile = Profile::new();
+// -----------------------------------------------------------------------------
 
 #[derive(Debug, Error)]
 pub enum RuntimeWorkerError {
@@ -460,11 +519,15 @@ impl WorkerSupervisor {
         request: &WorkerRequest,
         request_timeout: Duration,
     ) -> Result<WorkerResponse, RuntimeWorkerError> {
+        let profiling = profile_enabled();
+        let t0 = Instant::now();
+
         let encoded = serde_json::to_string(request)
             .map_err(|source| RuntimeWorkerError::Json {
                 context: "encode worker request",
                 source,
             })?;
+        let t1 = Instant::now();
 
         timeout(request_timeout, transport.write_frame(&encoded))
             .await
@@ -473,6 +536,7 @@ impl WorkerSupervisor {
                 stage: "writing request",
                 ms: request_timeout.as_millis(),
             })??;
+        let t2 = Instant::now();
 
         let frame = timeout(request_timeout, transport.read_frame(MAX_FRAME_SIZE))
             .await
@@ -481,12 +545,23 @@ impl WorkerSupervisor {
                 stage: "reading response",
                 ms: request_timeout.as_millis(),
             })??;
+        let t3 = Instant::now();
 
         let response: WorkerResponse = serde_json::from_str(&frame)
             .map_err(|source| RuntimeWorkerError::Json {
                 context: "decode worker response",
                 source,
             })?;
+        let t4 = Instant::now();
+
+        if profiling {
+            PROFILE.record(
+                t1.duration_since(t0),
+                t2.duration_since(t1),
+                t3.duration_since(t2),
+                t4.duration_since(t3),
+            );
+        }
 
         if response.protocol_version != PROTOCOL_VERSION {
             return Err(RuntimeWorkerError::ProtocolVersionMismatch {

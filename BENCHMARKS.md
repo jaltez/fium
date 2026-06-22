@@ -211,6 +211,62 @@ scripts/bench-native-ratelimit.sh
 
 1. ✅ **Benchmark + one Rust middleware** (CORS preflight — see above)
 2. ✅ **Stateful middleware into Rust** (rate-limit; session remains)
-3. ⬜ **Wire protocol** — binary over Unix socket / shared memory
-4. ⬜ **Hybrid middleware engine** — built-in middleware in Rust, user middleware in PHP
-5. ⬜ **Session into Rust** — same shared-state pattern as rate-limit, fixes session coherence
+3. ❌ **Wire protocol (binary framing)** — **investigated and deprioritized**: serialization is
+   only ~11µs/req (~1–3% of end-to-end), so binary framing isn't worth a zero-dep hand-rolled
+   protocol. See "Wire-protocol investigation" below.
+4. 👉 **Hybrid middleware engine** — now the priority: serve more request *classes* from Rust so
+   fewer requests cross the boundary at all (the 9×/8× wins came from eliminating the crossing,
+   not speeding it up).
+5. ⬜ **Session into Rust** — same shared-state pattern as rate-limit, if/when needed.
+
+---
+
+# Wire-protocol investigation: serialization is NOT the bottleneck
+
+Before building a binary wire format, we profiled `/bench/json` to see where the per-request
+IPC tax actually goes. The verdict flipped the plan: **serialization is a minor cost, so binary
+framing isn't worth it. The lever that pays off is moving whole request classes to Rust.**
+
+## Setup
+
+`FIUM_PROFILE` instruments both sides of the round-trip with tight around-the-call timing
+(`Instant` in Rust, `hrtime` in PHP), gated off by default. Harness: `scripts/profile-ipc.sh`,
+`workers=4`, concurrency 32, 6000 requests. Stable across runs.
+
+## Results (mean ns/request)
+
+| Stage | Rust | PHP |
+|---|---:|---:|
+| encode (request)  | 1,700 | 4,700 (decode) |
+| decode (response) | 3,100 | 1,200 (encode) |
+| write (pipe+flush) | 16,000 | 6,000 |
+| read  (fread/pipe) | 94,000 | 251,000 |
+| dispatch (handler) | — | 8,900 |
+
+## Interpretation
+
+- **The `read` stages are idle/scheduling wait, not I/O cost.** The worker blocks in `fread`
+  until Rust dispatches the next request (Rust pulls; the worker waits). This is true even at
+  `-c32`, so the 94µs/251µs reads are the worker *not working*, not a real cost. Ignore them.
+- **Tight-measured CPU costs per request**: serialization ≈ **10.8µs** (rust enc 1.7 + rust
+  dec 3.1 + php dec 4.7 + php enc 1.3), pipe writes ≈ **22µs** (rust 16 + php 6), handler
+  dispatch ≈ **9µs**.
+- **Serialization is ~11µs** — ~26% of the measurable CPU work (~42µs), but only **~1–3% of
+  the end-to-end latency** (~0.4ms). A binary format (≈2× faster encode/decode) would save
+  ~5µs/request: <13% throughput in the CPU-bound regime, ~1% of end-to-end. **Not worth a
+  ~400-line zero-dependency hand-rolled protocol with two-language lockstep risk.**
+- Notably, **the pipe writes (syscalls + flush) cost more than the serialization** — so even
+  the transfer, not the encoding, is the bigger crossing cost.
+
+## Conclusion + redirect
+
+The 9× (CORS) and 8× (rate-limit) wins came from **eliminating the crossing entirely** for
+whole request classes, not from making the crossing cheaper. The data confirms that's the right
+lever. Next priority is therefore the **hybrid middleware engine** (item 4): serve more request
+classes from Rust (security headers, require-json, auth-bearer short-circuits, more) so fewer
+requests pay *any* crossing cost.
+
+**Caveat:** payloads here are small. For routes with very large request/response bodies,
+serialization cost grows linearly and binary framing could matter more — worth re-measuring if
+such workloads become the target. For typical JSON-API requests, it doesn't.
+
