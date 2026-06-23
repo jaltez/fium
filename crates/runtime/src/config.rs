@@ -11,6 +11,9 @@ pub struct RuntimeConfig {
     pub max_requests: u64,
     pub worker_timeout_ms: u64,
     pub body_max_size: usize,
+    /// PHP binary used to spawn workers (default "php"). FIUM_PHP_BINARY env overrides
+    /// `[server] php_binary` in fium.toml, which overrides the default.
+    pub php_binary: String,
     pub tuning: TuningConfig,
     pub compression: CompressionConfig,
 
@@ -120,6 +123,7 @@ struct TomlServer {
     max_requests: Option<u64>,
     worker_timeout_ms: Option<u64>,
     body_max_size: Option<String>,
+    php_binary: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -284,6 +288,7 @@ impl RuntimeConfig {
             max_requests: 0,
             worker_timeout_ms: 5_000,
             body_max_size: 1024 * 1024,
+            php_binary: "php".to_string(),
             tuning: TuningConfig {
                 shutdown_timeout_secs: 30,
                 keep_alive_timeout_secs: 60,
@@ -376,6 +381,10 @@ impl RuntimeConfig {
                 .server
                 .worker_timeout_ms
                 .unwrap_or(defaults.worker_timeout_ms),
+            php_binary: std::env::var("FIUM_PHP_BINARY")
+                .ok()
+                .or(toml.server.php_binary.clone())
+                .unwrap_or_else(|| defaults.php_binary.clone()),
             body_max_size,
             tuning,
             compression,
@@ -499,6 +508,7 @@ mod tests {
             max_requests: 0,
             worker_timeout_ms: 5_000,
             body_max_size: 1_024,
+            php_binary: "php".into(),
             tuning: super::TuningConfig {
                 shutdown_timeout_secs: 30,
                 keep_alive_timeout_secs: 60,
@@ -531,6 +541,7 @@ mod tests {
                 max_requests: Some(25),
                 worker_timeout_ms: Some(9_000),
                 body_max_size: Some("2mb".into()),
+                php_binary: Some("/usr/local/bin/php8.4".into()),
             },
             tls: TomlTls {
                 cert: Some(PathBuf::from("/tmp/cert.pem")),
@@ -572,6 +583,7 @@ mod tests {
         assert_eq!(composed.workers, 4);
         assert_eq!(composed.max_requests, 25);
         assert_eq!(composed.worker_timeout_ms, 9_000);
+        assert_eq!(composed.php_binary, "/usr/local/bin/php8.4");
         assert_eq!(composed.body_max_size, 2 * 1024 * 1024);
         assert_eq!(composed.log_level, "debug");
         assert_eq!(composed.log_format, LogFormat::Json);

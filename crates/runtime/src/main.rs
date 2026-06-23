@@ -274,6 +274,7 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
     // Boot the worker pool
     info!(workers = cfg.workers, "booting PHP worker pool...");
     let pool = WorkerPool::new(
+        cfg.php_binary.clone(),
         worker_entrypoint.to_string_lossy().to_string(),
         app_path.to_string_lossy().to_string(),
         cfg.workers,
@@ -1018,6 +1019,7 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
 
     info!(workers = cfg.workers, "booting PHP worker pool (dev mode)...");
     let pool = WorkerPool::new(
+        cfg.php_binary.clone(),
         worker_entrypoint.to_string_lossy().to_string(),
         app_path.to_string_lossy().to_string(),
         cfg.workers,

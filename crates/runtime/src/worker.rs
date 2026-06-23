@@ -208,6 +208,7 @@ impl WorkerTransport for WorkerProcess {
 
 impl WorkerSupervisor {
     pub fn new(
+        php_binary: impl Into<String>,
         worker_entrypoint: impl Into<String>,
         app_file: impl Into<String>,
         request_timeout_ms: u64,
@@ -224,7 +225,7 @@ impl WorkerSupervisor {
         let errors = Arc::new(AtomicU64::new(0));
 
         let supervisor = Self {
-            php_binary: "php".to_string(),
+            php_binary: php_binary.into(),
             worker_entrypoint: PathBuf::from(worker_entrypoint.into()),
             app_file: PathBuf::from(app_file.into()),
             request_timeout: Duration::from_millis(timeout_ms),
@@ -746,6 +747,7 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     pub fn new(
+        php_binary: impl Into<String>,
         worker_entrypoint: impl Into<String>,
         app_file: impl Into<String>,
         count: usize,
@@ -755,11 +757,13 @@ impl WorkerPool {
     ) -> Self {
         let entrypoint = worker_entrypoint.into();
         let app = app_file.into();
+        let php_binary = php_binary.into();
         let count = count.max(1);
 
         let workers: Vec<WorkerSupervisor> = (0..count)
             .map(|_| {
                 WorkerSupervisor::new(
+                    php_binary.clone(),
                     entrypoint.clone(),
                     app.clone(),
                     worker_timeout_ms,
