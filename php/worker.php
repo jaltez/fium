@@ -2,6 +2,12 @@
 
 declare(strict_types=1);
 
+// stdout is the length-prefixed protocol channel to Rust. Route PHP's own error
+// display to stderr so boot-time errors/fatals never corrupt framing — a fatal written
+// to stdout gets read back as a 4-byte frame length (e.g. "\nFat" -> 172384628), which
+// surfaces on the Rust side as a bogus "frame too large" boot failure.
+ini_set('display_errors', 'stderr');
+
 spl_autoload_register(static function (string $class): void {
     $prefix = 'Fium\\';
 
@@ -20,7 +26,6 @@ spl_autoload_register(static function (string $class): void {
 use Fium\Application;
 
 $routesPath = $argv[1] ?? __DIR__ . '/routes.php';
-$application = Application::boot($routesPath);
 
 $stdin = fopen('php://stdin', 'r');
 $stdout = fopen('php://stdout', 'w');
@@ -112,9 +117,23 @@ function emit_profile_summary_if_due(): void
     ));
 }
 
-// Boot protocol: send route manifest as the first frame.
-write_frame_raw($stdout, $application->bootManifest());
-fflush($stdout);
+// Boot protocol: send route manifest as the first frame. Boot failures MUST stay off
+// stdout (the protocol channel): catch them, report to stderr, and exit non-zero so the
+// Rust side sees a clean worker death instead of a garbled frame.
+try {
+    $application = Application::boot($routesPath);
+    write_frame_raw($stdout, $application->bootManifest());
+    fflush($stdout);
+} catch (\Throwable $e) {
+    fwrite(STDERR, sprintf(
+        "BOOT FAILED: %s: %s in %s:%d\n",
+        get_class($e),
+        $e->getMessage(),
+        $e->getFile(),
+        $e->getLine()
+    ));
+    exit(1);
+}
 
 while (true) {
     $t0 = hrtime(true);

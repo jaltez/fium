@@ -483,12 +483,29 @@ impl WorkerSupervisor {
         transport: &mut T,
         boot_timeout: Duration,
     ) -> Result<BootMessage, RuntimeWorkerError> {
-        let frame = timeout(boot_timeout, transport.read_frame(MAX_FRAME_SIZE))
-            .await
-            .map_err(|_| RuntimeWorkerError::BootTimeout {
-                context: "waiting for boot message",
-                ms: boot_timeout.as_millis(),
-            })??;
+        let frame = match timeout(boot_timeout, transport.read_frame(MAX_FRAME_SIZE)).await {
+            Ok(Ok(frame)) => frame,
+            // A clean EOF means the worker process exited before booting — almost always a
+            // boot error, which is now reported on stderr (see worker.php BOOT FAILED). Map
+            // it to a clear cause instead of the opaque "read frame length" / "frame too
+            // large" errors that raw bytes on stdout used to produce.
+            Ok(Err(RuntimeWorkerError::Io { source, .. }))
+                if source.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                warn!(
+                    "worker exited before sending its boot message — a boot error was \
+                     likely reported to the php_worker log; try FIUM_DEBUG=1"
+                );
+                return Err(RuntimeWorkerError::WorkerShutdown);
+            }
+            Ok(Err(other)) => return Err(other),
+            Err(_) => {
+                return Err(RuntimeWorkerError::BootTimeout {
+                    context: "waiting for boot message",
+                    ms: boot_timeout.as_millis(),
+                })
+            }
+        };
 
         let boot: BootMessage = serde_json::from_str(&frame).map_err(|source| {
             RuntimeWorkerError::Json {
@@ -960,6 +977,28 @@ mod tests {
             error,
             RuntimeWorkerError::ProtocolVersionMismatch { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn read_boot_message_maps_worker_eof_to_shutdown() {
+        // A worker that exits before booting shows up as EOF on the pipe. That must surface
+        // as a clear WorkerShutdown, not an opaque "read frame length" / "frame too large".
+        let mut transport = MockTransport {
+            writes: Vec::new(),
+            reads: VecDeque::from([Err(RuntimeWorkerError::Io {
+                context: "read frame length",
+                source: std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof"),
+            })]),
+        };
+
+        let error = WorkerSupervisor::read_boot_message(
+            &mut transport,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("EOF should map to WorkerShutdown");
+
+        assert!(matches!(error, RuntimeWorkerError::WorkerShutdown));
     }
 
     #[test]

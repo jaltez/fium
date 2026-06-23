@@ -238,3 +238,58 @@ fn real_php_worker_rejects_protocol_mismatch() {
     drop(stdin);
     guard.child.as_mut().map(|c| c.kill());
 }
+
+#[test]
+fn real_php_worker_boot_failure_goes_to_stderr_not_stdout() {
+    // Regression for the "frame too large: 172384628" bug: a boot-time error written to
+    // stdout corrupted framing. It must now go to stderr, leaving stdout clean.
+    if !php_available() {
+        eprintln!("skipping: php binary not available");
+        return;
+    }
+    let Some((worker, _app)) = fixture_paths() else {
+        eprintln!("skipping: php sources not available");
+        return;
+    };
+
+    // An app that throws the moment it is required → Application::boot fails.
+    let broken = std::env::temp_dir().join(format!(
+        "fium-broken-boot-{}.php",
+        std::process::id()
+    ));
+    std::fs::write(
+        &broken,
+        "<?php\nthrow new RuntimeException('deliberate boot failure for e2e');\n",
+    )
+    .expect("write broken app fixture");
+
+    let output = Command::new("php")
+        .arg(worker)
+        .arg(&broken)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn php");
+
+    let _ = std::fs::remove_file(&broken);
+
+    // stdout is the protocol channel — must be completely clean (no frame, no error text).
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.is_empty(),
+        "stdout must stay clean on boot failure, got: {stdout:?}"
+    );
+
+    // stderr must explain the failure.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("BOOT FAILED") && stderr.contains("deliberate boot failure"),
+        "stderr should explain boot failure, got: {stderr:?}"
+    );
+
+    // Worker should exit non-zero.
+    assert!(
+        !output.status.success(),
+        "worker should exit non-zero on boot failure, got {:?}",
+        output.status
+    );
+}
