@@ -6,7 +6,7 @@ A fast PHP runtime powered by Rust. Write a single `app.php`, run `fium serve`, 
 
 - **Rust binary** owns HTTP serving, route matching, TLS, static files, compression, worker supervision, and metrics
 - **PHP** owns business logic — handlers, middleware, sessions, auth, caching
-- **Zero-dependency** PHP framework embedded in the binary
+- **Zero-Composer-dependency** PHP framework embedded in the binary
 - **Zero-config** by default — power users can add an optional `fium.toml`
 
 ## Quick start
@@ -61,7 +61,7 @@ Or with the example app:
 - Input validation with common rules
 - JSON, HTML, text, redirect, and empty response types
 - Database layer: lazy PDO connection, fluent query builder, and active-record
-  `Model` (zero-dependency, parameter-bound, identifier-validated)
+  `Model` (zero-composer-dependency, parameter-bound, identifier-validated)
 - Cache layer: in-process, file-backed, or optional Redis (phpredis) drivers
 
 ## Configuration
@@ -76,6 +76,7 @@ workers = 0           # 0 = auto (CPU count)
 max_requests = 0      # 0 = no limit (worker recycling)
 worker_timeout_ms = 5000
 body_max_size = "1mb"
+php_binary = "php"    # PHP executable (env: FIUM_PHP_BINARY)
 
 [tuning]
 shutdown_timeout_secs = 30
@@ -143,7 +144,7 @@ Built-in middleware aliases:
 | Compression | gzip/br | gzip (plugin) | gzip |
 | Metrics | Prometheus | Prometheus | Prometheus |
 | Worker model | Process pool | Process pool | Threads (C module) |
-| PHP dependency | None | Composer package | PHP extension |
+| PHP dependency | System PHP (no Composer, no extension) | Composer package | Embedded (bundled) |
 | Binary size | Single binary | Single binary | Single binary |
 
 ## Runtime Probes

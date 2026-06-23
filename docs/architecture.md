@@ -68,7 +68,7 @@ Two message kinds cross the boundary:
 Protocol version mismatches are rejected on both sides, so the contract can
 evolve explicitly.
 
-## Embedding and the zero-dependency rule
+## Embedding and the zero-Composer-dependency rule
 
 `crates/runtime/src/embed.rs` compiles **only `php/worker.php` and `php/src/`**
 into the binary with `include_str!` / `include_dir!`. On startup it extracts
@@ -114,7 +114,7 @@ with cycle detection.
 ## Data layer
 
 The framework ships a small, safe data layer that respects the
-zero-dependency rule:
+zero-Composer-dependency rule:
 
 - `Fium\Database\Connection` — a lazily-configured PDO singleton, driven by
   `FIUM_DB_*` environment variables or explicit injection.
