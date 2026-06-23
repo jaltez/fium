@@ -14,6 +14,18 @@ pub struct BootMessage {
     #[serde(rename = "type")]
     pub message_type: String,
     pub routes: Vec<BootRoute>,
+    /// Global CORS config resolved by PHP (from `.env`/Config), so Rust's native preflight
+    /// path uses the same values the PHP `Cors` middleware would — not the process env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<BootCors>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootCors {
+    pub origins: String,
+    pub methods: String,
+    pub headers: String,
+    pub max_age: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

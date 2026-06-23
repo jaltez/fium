@@ -185,10 +185,10 @@ proving the lock serializes the check correctly across simultaneous connections.
 
 Tracked from code review. Both toggles ship **off by default**, so these are latent, not live.
 
-- **[blocker] CORS `.env` divergence** (`main.rs::native_cors_preflight_response`) — Rust reads
-  process env; PHP reads the app `.env`. A `.env`-configured `FIUM_CORS_ORIGINS` is ignored by
-  native CORS, which would then serve `*` for a single-origin policy. Resolve via RuntimeConfig
-  or boot-manifest config plumbing. *(CORS spike, already committed.)*
+- **[fixed] CORS `.env` divergence** (`main.rs::native_cors_preflight_response`) — Rust now reads
+  CORS config from the boot manifest (`BootCors`), which PHP resolves from `.env`/Config. A
+  `.env`-configured origin is now honored by the native path instead of being silently turned
+  into `*`.
 - **[fixed] Purge evicted non-expired buckets** (`ratelimit.rs`) — purge now uses each bucket's
   own window, so long-window routes (e.g. `ratelimit:N,86400`) are no longer under-limited once
   the map exceeds 4096 entries.

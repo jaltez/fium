@@ -173,6 +173,15 @@ final class Application
             'protocol_version' => 1,
             'type' => 'boot',
             'routes' => $routes,
+            // Resolve CORS config here (from .env/Config) so the Rust-side native
+            // preflight path uses exactly what the PHP Cors middleware would — not the
+            // process env (which would diverge from a .env-configured origin).
+            'cors' => [
+                'origins' => Config::get('FIUM_CORS_ORIGINS', '*'),
+                'methods' => Config::get('FIUM_CORS_METHODS', 'GET, POST, PUT, PATCH, DELETE, OPTIONS'),
+                'headers' => Config::get('FIUM_CORS_HEADERS', 'Content-Type, Authorization, Accept, X-Requested-With'),
+                'max_age' => Config::get('FIUM_CORS_MAX_AGE', '86400'),
+            ],
         ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
     }
 

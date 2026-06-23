@@ -7,21 +7,28 @@
 //! changes an optionality, these tests fail.
 
 use fium_transport::{
-    BootMessage, BootRoute, CookieMap, HeaderMap, SetCookie, WorkerError, WorkerRequest,
+    BootCors, BootMessage, BootRoute, CookieMap, HeaderMap, SetCookie, WorkerError, WorkerRequest,
     WorkerResponse, PROTOCOL_VERSION,
 };
 use std::collections::BTreeMap;
 
 #[test]
 fn boot_message_matches_php_manifest_shape() {
-    // Verbatim shape produced by Application::bootManifest() in PHP.
+    // Verbatim shape produced by Application::bootManifest() in PHP (cors is always
+    // present; it's optional on the wire so an older worker without it still deserializes).
     let json = r#"{
         "protocol_version": 1,
         "type": "boot",
         "routes": [
             {"method": "GET", "path": "/ping", "name": "get_ping", "middleware": ["add-powered-by"]},
             {"method": "GET", "path": "/users/{id}", "name": "users.show", "middleware": []}
-        ]
+        ],
+        "cors": {
+            "origins": "https://example.com",
+            "methods": "GET, POST",
+            "headers": "Content-Type, Authorization",
+            "max_age": "600"
+        }
     }"#;
 
     let boot: BootMessage = serde_json::from_str(json).expect("PHP boot shape must deserialize");
@@ -32,6 +39,18 @@ fn boot_message_matches_php_manifest_shape() {
     assert_eq!(boot.routes[0].name, "get_ping");
     assert_eq!(boot.routes[0].middleware, vec!["add-powered-by"]);
     assert_eq!(boot.routes[1].path, "/users/{id}");
+
+    let cors = boot.cors.expect("cors config present");
+    assert_eq!(cors.origins, "https://example.com");
+    assert_eq!(cors.max_age, "600");
+}
+
+#[test]
+fn boot_message_omits_cors_when_absent() {
+    // An older worker that sends no cors must still deserialize (field is optional).
+    let json = r#"{"protocol_version":1,"type":"boot","routes":[]}"#;
+    let boot: BootMessage = serde_json::from_str(json).expect("parses without cors");
+    assert!(boot.cors.is_none());
 }
 
 #[test]
@@ -45,12 +64,28 @@ fn boot_message_serializes_back_with_type_rename() {
             name: "home".into(),
             middleware: vec![],
         }],
+        cors: None,
     };
 
     let json = serde_json::to_string(&boot).expect("encode");
     // The `message_type` field must serialize as `type` on the wire.
     assert!(json.contains(r#""type":"boot""#));
     assert!(!json.contains(r#""message_type""#));
+    // cors is None -> skipped (skip_serializing_if).
+    assert!(!json.contains(r#""cors""#));
+}
+
+#[test]
+fn boot_cors_round_trips() {
+    let cors = BootCors {
+        origins: "*".into(),
+        methods: "GET, POST".into(),
+        headers: "Content-Type".into(),
+        max_age: "86400".into(),
+    };
+    let json = serde_json::to_string(&cors).expect("encode");
+    let back: BootCors = serde_json::from_str(&json).expect("decode");
+    assert_eq!(back, cors);
 }
 
 #[test]

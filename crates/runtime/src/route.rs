@@ -1,5 +1,5 @@
 use crate::ratelimit::{parse_rate_limit_alias, RateLimitConfig};
-use fium_transport::BootRoute;
+use fium_transport::{BootCors, BootRoute};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
@@ -39,6 +39,8 @@ pub struct RouteTable {
     /// Routes that declare a `ratelimit` directive, with the parsed config, so Rust
     /// can enforce the limit pool-wide without a PHP round-trip.
     rate_limits: HashMap<String, RateLimitConfig>,
+    /// Global CORS config resolved by PHP, used by Rust's native preflight path.
+    cors: Option<BootCors>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,7 +56,10 @@ pub enum RouteError {
 }
 
 impl RouteTable {
-    pub fn from_boot_routes(boot_routes: Vec<BootRoute>) -> Result<Self, RouteError> {
+    pub fn from_boot_routes(
+        boot_routes: Vec<BootRoute>,
+        cors: Option<BootCors>,
+    ) -> Result<Self, RouteError> {
         if boot_routes.is_empty() {
             return Err(RouteError::EmptyBootRoutes);
         }
@@ -104,6 +109,7 @@ impl RouteTable {
             routes,
             cors_paths,
             rate_limits,
+            cors,
         })
     }
 
@@ -175,6 +181,12 @@ impl RouteTable {
     pub fn rate_limit_for(&self, route_name: &str) -> Option<&RateLimitConfig> {
         self.rate_limits.get(route_name)
     }
+
+    /// Global CORS config resolved by PHP, for Rust's native preflight path. `None` if
+    /// the worker didn't advertise any (older worker).
+    pub fn cors(&self) -> Option<&BootCors> {
+        self.cors.as_ref()
+    }
 }
 
 fn split_segments(path: &str) -> Vec<&str> {
@@ -230,7 +242,7 @@ mod tests {
             })
             .collect();
 
-        RouteTable::from_boot_routes(boot_routes).expect("route table should build")
+        RouteTable::from_boot_routes(boot_routes, None).expect("route table should build")
     }
 
     fn table_with_middleware(routes: &[(&str, &str, &str, &[&str])]) -> RouteTable {
@@ -244,7 +256,7 @@ mod tests {
             })
             .collect();
 
-        RouteTable::from_boot_routes(boot_routes).expect("route table should build")
+        RouteTable::from_boot_routes(boot_routes, None).expect("route table should build")
     }
 
     #[test]

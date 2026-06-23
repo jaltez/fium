@@ -15,7 +15,7 @@ use axum::{
 };
 use clap::Parser;
 use config::{CompressionConfig, LogFormat, RuntimeConfig};
-use fium_transport::{CookieMap, HeaderMap, SetCookie, WorkerRequest, PROTOCOL_VERSION};
+use fium_transport::{BootCors, CookieMap, HeaderMap, SetCookie, WorkerRequest, PROTOCOL_VERSION};
 use http_body_util::BodyExt;
 use route::RouteTable;
 use ratelimit::{Allow, RateLimiter};
@@ -618,9 +618,13 @@ async fn dispatch(
     // (Rust) paths for measurement. With this off, an OPTIONS to a POST route still
     // 404s at the route layer — i.e. CORS preflight is effectively broken today.
     if state.config.native_cors_preflight && method == "OPTIONS" {
-        let serves_preflight = state.routes.load().cors_preflight_target(&path);
-        if serves_preflight {
-            return native_cors_preflight_response();
+        let routes = state.routes.load();
+        if routes.cors_preflight_target(&path) {
+            // CORS config comes from the boot manifest (resolved by PHP from .env), so the
+            // native path serves the same origin/method policy the PHP Cors middleware would.
+            if let Some(cors) = routes.cors() {
+                return native_cors_preflight_response(cors);
+            }
         }
     }
 
@@ -1195,45 +1199,27 @@ fn parse_cookies(headers: &axum::http::HeaderMap) -> CookieMap {
     cookies
 }
 
-/// Build a CORS preflight response entirely in Rust, mirroring the headers the PHP
-/// `Cors` middleware emits (same env vars, same defaults). Producing the same bytes
-/// means before/after measurements isolate the PHP round-trip cost, not the response.
-///
-/// TODO(world-b prod-readiness): this reads the *process* env (`std::env::var`), but PHP's
-/// `Cors` reads the app's `.env` via `Config::loadEnv`. A user who sets FIUM_CORS_ORIGINS
-/// in `.env` gets it applied by PHP but IGNORED here — so native CORS would serve `*` for a
-/// configured single-origin policy. Resolve by threading CORS config through RuntimeConfig
-/// or the boot manifest before flipping FIUM_NATIVE_CORS on by default.
-fn native_cors_preflight_response() -> Response {
-    fn env_or(key: &str, default: &str) -> String {
-        std::env::var(key).unwrap_or_else(|_| default.to_string())
-    }
-
-    let origin = env_or("FIUM_CORS_ORIGINS", "*");
-    let methods = env_or("FIUM_CORS_METHODS", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
-    let headers = env_or(
-        "FIUM_CORS_HEADERS",
-        "Content-Type, Authorization, Accept, X-Requested-With",
-    );
-    let max_age = env_or("FIUM_CORS_MAX_AGE", "86400");
-
+/// Build a CORS preflight response entirely in Rust, using the CORS config PHP resolved
+/// (from `.env`/Config) and sent in the boot manifest — so the native path serves the same
+/// origin/method policy the PHP `Cors` middleware would, never a divergent `*`.
+fn native_cors_preflight_response(cors: &BootCors) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::NO_CONTENT;
     let response_headers = response.headers_mut();
     for (name, value) in [
         (
             axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-            origin.as_str(),
+            cors.origins.as_str(),
         ),
         (
             axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
-            methods.as_str(),
+            cors.methods.as_str(),
         ),
         (
             axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
-            headers.as_str(),
+            cors.headers.as_str(),
         ),
-        (axum::http::header::ACCESS_CONTROL_MAX_AGE, max_age.as_str()),
+        (axum::http::header::ACCESS_CONTROL_MAX_AGE, cors.max_age.as_str()),
     ] {
         if let Ok(value) = HeaderValue::from_str(value) {
             response_headers.insert(name, value);
@@ -1338,7 +1324,7 @@ mod tests {
         RequestDurationHistogram, MAX_IN_MEMORY_REQUEST_BODY_BYTES,
     };
     use axum::body::Body;
-    use fium_transport::SetCookie;
+    use fium_transport::{BootCors, SetCookie};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tokio::time::Duration;
 
@@ -1386,14 +1372,30 @@ mod tests {
     }
 
     #[test]
-    fn native_cors_preflight_response_emits_cors_headers() {
-        let response = native_cors_preflight_response();
+    fn native_cors_preflight_response_uses_manifest_config() {
+        // The native path must serve exactly the config PHP resolved (not env defaults),
+        // so a single-origin policy is never silently turned into "*".
+        let cors = BootCors {
+            origins: "https://example.com".into(),
+            methods: "GET, POST".into(),
+            headers: "Content-Type".into(),
+            max_age: "600".into(),
+        };
+        let response = native_cors_preflight_response(&cors);
         assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
         let headers = response.headers();
-        assert!(headers.contains_key("access-control-allow-origin"));
-        assert!(headers.contains_key("access-control-allow-methods"));
-        assert!(headers.contains_key("access-control-allow-headers"));
-        assert!(headers.contains_key("access-control-max-age"));
+        assert_eq!(
+            headers.get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            headers.get("access-control-allow-methods").and_then(|v| v.to_str().ok()),
+            Some("GET, POST")
+        );
+        assert_eq!(
+            headers.get("access-control-max-age").and_then(|v| v.to_str().ok()),
+            Some("600")
+        );
     }
 
     #[test]

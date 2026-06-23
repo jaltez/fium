@@ -323,7 +323,7 @@ impl WorkerSupervisor {
 
         info!(route_count = boot.routes.len(), "worker booted successfully");
 
-        Ok(RouteTable::from_boot_routes(boot.routes)?)
+        Ok(RouteTable::from_boot_routes(boot.routes, boot.cors)?)
     }
 
     /// Queue a request to be processed by this worker. Returns immediately;
@@ -963,6 +963,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION + 1,
             message_type: "boot".into(),
             routes: Vec::new(),
+            cors: None,
         })
         .expect("boot should encode");
         let mut transport = MockTransport {
