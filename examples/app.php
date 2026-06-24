@@ -5,47 +5,60 @@ declare(strict_types=1);
 use Fium\Runtime\Request;
 use Fium\Runtime\Response;
 
+// This is a standalone example app, separate from the embedded framework. Its own handler
+// classes live under App\ (examples/src/); register an autoloader for them. The runtime
+// already autoloads Fium\ -> the embedded framework source, so both resolve.
+spl_autoload_register(static function (string $class): void {
+    if (!str_starts_with($class, 'App\\')) {
+        return;
+    }
+    $path = __DIR__ . '/src/' . str_replace('\\', '/', substr($class, 4)) . '.php';
+    if (is_file($path)) {
+        require $path;
+    }
+});
+
 return [
     // Global middleware applied to all routes
     'middleware' => ['add-powered-by'],
 
     'GET /' => [
         'middleware' => ['start-session'],
-        'handler' => 'Fium\\Handlers\\HomeHandler',
+        'handler' => 'App\\Handlers\\HomeHandler',
     ],
 
-    'GET /hello/{name}' => 'Fium\\Handlers\\HelloHandler',
+    'GET /hello/{name}' => 'App\\Handlers\\HelloHandler',
 
     'GET /csrf-token' => [
         'middleware' => ['start-session'],
-        'handler' => 'Fium\\Handlers\\CsrfTokenHandler',
+        'handler' => 'App\\Handlers\\CsrfTokenHandler',
     ],
 
     'POST /login' => [
         'middleware' => ['start-session', 'verify-csrf'],
-        'handler' => 'Fium\\Handlers\\LoginHandler',
+        'handler' => 'App\\Handlers\\LoginHandler',
     ],
 
     'POST /register' => [
         'middleware' => ['start-session', 'verify-csrf'],
-        'handler' => 'Fium\\Handlers\\RegisterHandler',
+        'handler' => 'App\\Handlers\\RegisterHandler',
     ],
 
     'POST /logout' => [
         'middleware' => ['start-session', 'verify-csrf'],
-        'handler' => 'Fium\\Handlers\\LogoutHandler',
+        'handler' => 'App\\Handlers\\LogoutHandler',
     ],
 
     'GET /me' => [
         'middleware' => ['start-session', 'auth-session'],
-        'handler' => 'Fium\\Handlers\\CurrentUserHandler',
+        'handler' => 'App\\Handlers\\CurrentUserHandler',
     ],
 
-    'GET /email/verify' => 'Fium\\Handlers\\VerifyEmailHandler',
+    'GET /email/verify' => 'App\\Handlers\\VerifyEmailHandler',
 
     'GET /admin' => [
         'middleware' => ['start-session', 'auth-session', 'role:admin'],
-        'handler' => 'Fium\\Handlers\\AdminDashboardHandler',
+        'handler' => 'App\\Handlers\\AdminDashboardHandler',
     ],
 
     // Route group: API routes share prefix and middleware
@@ -53,38 +66,38 @@ return [
         'prefix' => '/api',
         'middleware' => ['require-json'],
         'routes' => [
-            'POST /forgot-password' => 'Fium\\Handlers\\PasswordResetLinkHandler',
-            'POST /reset-password' => 'Fium\\Handlers\\ResetPasswordHandler',
-            'POST /register' => 'Fium\\Handlers\\ApiRegisterHandler',
-            'POST /login' => 'Fium\\Handlers\\ApiLoginHandler',
-            'POST /refresh' => 'Fium\\Handlers\\ApiRefreshTokenHandler',
+            'POST /forgot-password' => 'App\\Handlers\\PasswordResetLinkHandler',
+            'POST /reset-password' => 'App\\Handlers\\ResetPasswordHandler',
+            'POST /register' => 'App\\Handlers\\ApiRegisterHandler',
+            'POST /login' => 'App\\Handlers\\ApiLoginHandler',
+            'POST /refresh' => 'App\\Handlers\\ApiRefreshTokenHandler',
             'POST /logout' => [
                 'middleware' => ['auth-bearer'],
-                'handler' => 'Fium\\Handlers\\ApiLogoutHandler',
+                'handler' => 'App\\Handlers\\ApiLogoutHandler',
             ],
             'POST /email/verification-link' => [
                 'middleware' => ['auth-bearer'],
-                'handler' => 'Fium\\Handlers\\EmailVerificationLinkHandler',
+                'handler' => 'App\\Handlers\\EmailVerificationLinkHandler',
             ],
             'GET /me' => [
                 'middleware' => ['auth-bearer'],
-                'handler' => 'Fium\\Handlers\\ApiMeHandler',
+                'handler' => 'App\\Handlers\\ApiMeHandler',
             ],
         ],
     ],
 
     'GET /session' => [
         'middleware' => ['start-session'],
-        'handler' => 'Fium\\Handlers\\SessionHandler',
+        'handler' => 'App\\Handlers\\SessionHandler',
     ],
 
-    'GET /boom' => 'Fium\\Handlers\\ThrowHandler',
+    'GET /boom' => 'App\\Handlers\\ThrowHandler',
 
-    'GET /_runtime/crash-once' => 'Fium\\Handlers\\CrashOnceHandler',
+    'GET /_runtime/crash-once' => 'App\\Handlers\\CrashOnceHandler',
 
-    'GET /_runtime/slow-once' => 'Fium\\Handlers\\SlowOnceHandler',
+    'GET /_runtime/slow-once' => 'App\\Handlers\\SlowOnceHandler',
 
-    'GET /_runtime/always-slow' => 'Fium\\Handlers\\AlwaysSlowHandler',
+    'GET /_runtime/always-slow' => 'App\\Handlers\\AlwaysSlowHandler',
 
     // Example: closure-based inline handler
     'GET /ping' => fn(Request $r) => Response::json(['pong' => true]),

@@ -35,9 +35,9 @@ impl Drop for WorkerGuard {
 }
 
 fn fixture_paths() -> Option<(&'static Path, &'static Path)> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../php");
-    let worker = root.join("worker.php");
-    let app = root.join("app.php");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let worker = manifest.join("../../php/worker.php");
+    let app = manifest.join("../../examples/app.php");
     if !worker.is_file() || !app.is_file() {
         return None;
     }

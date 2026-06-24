@@ -2,21 +2,21 @@
 
 declare(strict_types=1);
 
-namespace Fium\Handlers;
+namespace App\Handlers;
 
 use Fium\Contracts\Handler;
 use Fium\Runtime\Request;
 use Fium\Runtime\Response;
 
-final class HomeHandler implements Handler
+final class AlwaysSlowHandler implements Handler
 {
     public function __invoke(Request $request): Response
     {
+        usleep(1500000);
+
         return Response::json([
             'ok' => true,
-            'message' => 'Welcome to Fium.',
-            'route' => $request->attribute('route_name', $request->matchedRoute()),
-            'path' => $request->path(),
+            'route' => (string) $request->matchedRoute(),
         ]);
     }
 }

@@ -2,28 +2,28 @@
 
 declare(strict_types=1);
 
-namespace Fium\Handlers;
+namespace App\Handlers;
 
 use Fium\Contracts\Handler;
 use Fium\Runtime\Request;
 use Fium\Runtime\Response;
 
-final class CurrentUserHandler implements Handler
+final class CsrfTokenHandler implements Handler
 {
     public function __invoke(Request $request): Response
     {
-        $user = $request->user();
+        $token = $request->csrfToken();
 
-        if ($user === null) {
+        if (!is_string($token) || $token === '') {
             return Response::json([
                 'ok' => false,
-                'error' => 'unauthenticated',
-            ], 401);
+                'error' => 'session_unavailable',
+            ], 500);
         }
 
         return Response::json([
             'ok' => true,
-            'user' => $user->toArray(),
-        ]);
+            'csrf_token' => $token,
+        ])->withHeader('x-csrf-token', $token);
     }
 }

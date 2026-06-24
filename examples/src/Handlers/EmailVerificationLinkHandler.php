@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Fium\Handlers;
+namespace App\Handlers;
 
 use Fium\Auth\EmailVerificationTokenService;
 use Fium\Contracts\Handler;

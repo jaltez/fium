@@ -2,20 +2,20 @@
 
 declare(strict_types=1);
 
-namespace Fium\Handlers;
+namespace App\Handlers;
 
+use Fium\Auth\PasswordResetTokenService;
 use Fium\Contracts\Handler;
 use Fium\Runtime\Request;
 use Fium\Runtime\Response;
 
-final class RegisterHandler implements Handler
+final class PasswordResetLinkHandler implements Handler
 {
     public function __invoke(Request $request): Response
     {
-        $session = $request->session();
         $authenticator = $request->authenticator();
 
-        if ($session === null || $authenticator === null || !$authenticator->canRegister()) {
+        if ($authenticator === null || !$authenticator->canResetPasswords()) {
             return Response::json([
                 'ok' => false,
                 'error' => 'auth_unavailable',
@@ -24,25 +24,19 @@ final class RegisterHandler implements Handler
 
         $validator = $request->validate([
             'email' => 'required|email',
-            'password' => 'required|string|min:6',
         ]);
 
         if ($validator->fails()) {
             return Response::validationError($validator->errors());
         }
 
-        $user = $authenticator->register($validator->validated(), $session, $request->boolean('remember'));
-
-        if ($user === null) {
-            return Response::json([
-                'ok' => false,
-                'error' => 'email_already_taken',
-            ], 409);
-        }
+        $user = $authenticator->userByEmail((string) ($validator->validated()['email'] ?? ''));
+        $tokenService = PasswordResetTokenService::boot($authenticator);
 
         return Response::json([
             'ok' => true,
-            'user' => $user->toArray(),
-        ], 201);
+            'reset_token' => $user?->id() !== null ? $tokenService->issue($user) : null,
+            'expires_in' => $tokenService->ttlSeconds(),
+        ]);
     }
 }

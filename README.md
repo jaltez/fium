@@ -26,7 +26,7 @@ cd myapp
 Or with the example app:
 
 ```bash
-./target/debug/fium serve php/app.php
+./target/debug/fium serve examples/app.php
 ```
 
 ## Features
@@ -112,7 +112,7 @@ crates/runtime/     Rust HTTP runtime (fium binary)
 crates/transport/   Shared protocol types (Rust ↔ PHP)
 docs/               Protocol spec and guides
 php/src/            PHP framework source
-php/app.php         Example application
+examples/app.php   Example application (standalone; own handlers under App\)
 scripts/            Benchmark probes
 ```
 

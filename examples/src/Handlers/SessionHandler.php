@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Fium\Handlers;
+namespace App\Handlers;
 
 use Fium\Contracts\Handler;
 use Fium\Runtime\Request;

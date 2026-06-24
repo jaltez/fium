@@ -2,42 +2,37 @@
 
 declare(strict_types=1);
 
-namespace Fium\Handlers;
+namespace App\Handlers;
 
 use Fium\Contracts\Handler;
 use Fium\Runtime\Request;
 use Fium\Runtime\Response;
 
-final class ApiRegisterHandler implements Handler
+final class ApiLoginHandler implements Handler
 {
     public function __invoke(Request $request): Response
     {
         $authenticator = $request->authenticator();
         $tokenService = $request->tokenService();
+        $payload = [
+            'email' => $request->input('email'),
+            'password' => $request->input('password'),
+        ];
 
-        if ($authenticator === null || $tokenService === null || !$authenticator->canRegister()) {
+        if ($authenticator === null || $tokenService === null) {
             return Response::json([
                 'ok' => false,
                 'error' => 'auth_unavailable',
             ], 500);
         }
 
-        $validator = $request->validate([
-            'email' => 'required|email',
-            'password' => 'required|string|min:6',
-        ]);
-
-        if ($validator->fails()) {
-            return Response::validationError($validator->errors());
-        }
-
-        $user = $authenticator->register($validator->validated());
+        $user = $authenticator->validateCredentials($payload);
 
         if ($user === null) {
             return Response::json([
                 'ok' => false,
-                'error' => 'email_already_taken',
-            ], 409);
+                'error' => 'invalid_credentials',
+            ], 401);
         }
 
         return Response::json([
@@ -48,6 +43,6 @@ final class ApiRegisterHandler implements Handler
             'refresh_token' => $tokenService->issueRefreshToken($user),
             'refresh_expires_in' => $tokenService->refreshTtlSeconds(),
             'user' => $user->toArray(),
-        ], 201);
+        ]);
     }
 }
