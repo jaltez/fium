@@ -12,8 +12,11 @@ use Fium\Validator;
 
 final class Request
 {
+    /** @var array<string, mixed>|null */
     private ?array $parsedQuery = null;
+    /** @var array<string, mixed>|null */
     private ?array $parsedJson = null;
+    /** @var array<string, mixed>|null */
     private ?array $parsedForm = null;
     private ?string $loadedBody = null;
     private bool $bodyLoaded = false;
@@ -237,18 +240,16 @@ final class Request
 
         if ($contentType === 'application/x-www-form-urlencoded') {
             parse_str($body, $parsed);
-            $this->parsedForm = is_array($parsed) ? $parsed : null;
+            $this->parsedForm = $parsed;
 
             return $this->parsedForm;
         }
 
-        if ($contentType === 'multipart/form-data') {
-            $this->parsedForm = $this->parseMultipartForm($body);
+        // Line 228 guarantees $contentType is one of the two form types; having ruled
+        // out urlencoded above, this is multipart/form-data.
+        $this->parsedForm = $this->parseMultipartForm($body);
 
-            return $this->parsedForm;
-        }
-
-        return null;
+        return $this->parsedForm;
     }
 
     public function input(string $key, mixed $default = null): mixed
@@ -482,7 +483,7 @@ final class Request
 
         parse_str(implode('&', $pairs), $parsed);
 
-        return is_array($parsed) ? $parsed : null;
+        return $parsed;
     }
 
     private function isFormContentType(?string $contentType): bool

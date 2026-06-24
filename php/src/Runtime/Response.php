@@ -9,7 +9,10 @@ final class Response
     /** @var list<array{name: string, value: string, path: ?string, http_only: bool, secure: bool}> */
     private array $cookies = [];
 
-    /** @param array<string, list<string>> $headers */
+    /**
+     * @param array<string, list<string>> $headers
+     * @param array<string, string>|null $error
+     */
     private function __construct(
         private int $status,
         private array $headers,

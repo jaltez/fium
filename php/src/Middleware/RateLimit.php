@@ -23,7 +23,7 @@ final class RateLimit implements Middleware
     public function __construct(string $limit = '60')
     {
         $parts = explode(',', $limit, 2);
-        $this->maxRequests = max(1, (int) ($parts[0] ?? 60));
+        $this->maxRequests = max(1, (int) $parts[0]);
         $this->windowSeconds = max(1, (int) ($parts[1] ?? 60));
     }
 

@@ -1,0 +1,7 @@
+parameters:
+    level: 6
+    paths:
+        - src
+    # Static analysis is part of CI and the agent-DX loop: a green `composer check`
+    # (stan + tests) is the deterministic correctness signal for both humans and coding
+    # agents. Bump `level` toward `max` as remaining findings are resolved.

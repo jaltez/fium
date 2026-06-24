@@ -185,7 +185,10 @@ final class Application
         ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
     }
 
-    /** @param array<string, mixed> $workerRequest */
+    /**
+     * @param array<string, mixed> $workerRequest
+     * @return array<string, mixed>
+     */
     public function handleWorkerRequest(array $workerRequest): array
     {
         $requestId = isset($workerRequest['request_id']) ? (string) $workerRequest['request_id'] : null;

@@ -12,6 +12,9 @@ namespace Fium\Database;
  * more complex, {@see query()} returns a fresh query builder to chain on.
  *
  * Like the rest of the framework this ships with no external dependencies.
+ *
+ * @phpstan-consistent-constructor Subclasses promise a constructor compatible with
+ *   `__construct(array $attributes = [])`, so `new static()` in the factories is safe.
  */
 abstract class Model
 {
@@ -21,7 +24,7 @@ abstract class Model
     /** The primary key column. */
     protected string $primaryKey = 'id';
 
-    /** Mass-assignment allow-list. Only these keys may be set via fill()/create(). */
+    /** @var list<string> Mass-assignment allow-list. Only these keys may be set via fill()/create(). */
     protected array $fillable = [];
 
     /** @var array<string, mixed> */

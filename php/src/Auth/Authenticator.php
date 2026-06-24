@@ -108,6 +108,9 @@ final class Authenticator
 
         $passwordHash = password_hash($password, PASSWORD_DEFAULT);
 
+        // password_hash() with PASSWORD_DEFAULT is effectively non-failing on modern PHP;
+        // kept as a defensive guard for a security-sensitive value.
+        // @phpstan-ignore-next-line
         if (!is_string($passwordHash) || $passwordHash === '') {
             throw new \RuntimeException('Failed to hash the user password.');
         }
@@ -173,6 +176,9 @@ final class Authenticator
 
         $passwordHash = password_hash($password, PASSWORD_DEFAULT);
 
+        // password_hash() with PASSWORD_DEFAULT is effectively non-failing on modern PHP;
+        // kept as a defensive guard for a security-sensitive value.
+        // @phpstan-ignore-next-line
         if (!is_string($passwordHash) || $passwordHash === '') {
             throw new \RuntimeException('Failed to hash the user password.');
         }
@@ -185,12 +191,12 @@ final class Authenticator
 
         $updatedUser = $this->hydrateUser($record);
 
-        if ($this->store instanceof MutableUserStore) {
-            $revokedUser = $this->revokeTokens($updatedUser);
+        // updatePassword() early-returns unless the store is mutable, so this is guaranteed
+        // MutableUserStore here — revoke any outstanding tokens for the changed password.
+        $revokedUser = $this->revokeTokens($updatedUser);
 
-            if ($revokedUser !== null) {
-                return $revokedUser;
-            }
+        if ($revokedUser !== null) {
+            return $revokedUser;
         }
 
         return $updatedUser;

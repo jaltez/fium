@@ -110,7 +110,10 @@ final class PdoUserStore implements MutableUserStore
             . ')'
         );
 
-        $columns = $this->pdo->query('PRAGMA table_info(users)')?->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+        // query() returns PDOStatement|false; the previous `?->` only short-circuited null,
+        // so a false return would have thrown a TypeError on ->fetchAll().
+        $statement = $this->pdo->query('PRAGMA table_info(users)');
+        $columns = $statement === false ? [] : $statement->fetchAll(\PDO::FETCH_ASSOC);
         $columnNames = array_map(static fn (array $column): string => (string) ($column['name'] ?? ''), $columns);
 
         if (!in_array('email_verified_at', $columnNames, true)) {

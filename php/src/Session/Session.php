@@ -97,7 +97,7 @@ final class Session
             'new' => [],
         ];
 
-        if ($nextState['old'] === [] && $nextState['new'] === []) {
+        if ($nextState['old'] === []) {
             if (array_key_exists(self::FLASH_DATA_KEY, $this->data)) {
                 unset($this->data[self::FLASH_DATA_KEY]);
                 $changed = true;
