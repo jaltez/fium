@@ -960,6 +960,23 @@ async fn dispatch(
                 }
             }
 
+            // Native security headers: if the route declares security-headers/secure and
+            // native enforcement is on, stamp the headers here so the PHP middleware is a
+            // no-op (it defers when FIUM_NATIVE_SECURITY_HEADERS is set).
+            if state.config.native_security_headers
+                && state
+                    .routes
+                    .load()
+                    .middleware_for(route_name)
+                    .is_some_and(|middleware| {
+                        middleware
+                            .iter()
+                            .any(|m| m == "security-headers" || m == "secure")
+                    })
+            {
+                inject_security_headers(&mut response);
+            }
+
             response
         }
         Err(error) => {
@@ -1465,6 +1482,29 @@ fn parse_cookies(headers: &axum::http::HeaderMap) -> CookieMap {
     cookies
 }
 
+/// Inject the standard security headers the PHP `SecurityHeaders` middleware adds, so a
+/// response doesn't need to cross into PHP to acquire them. Mirrors that middleware's set.
+fn inject_security_headers(response: &mut Response) {
+    let headers = response.headers_mut();
+    for (name, value) in [
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "strict-origin-when-cross-origin"),
+        ("x-xss-protection", "0"),
+        (
+            "permissions-policy",
+            "camera=(), microphone=(), geolocation=()",
+        ),
+    ] {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::header::HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+}
+
 /// Build a CORS preflight response entirely in Rust, using the CORS config PHP resolved
 /// (from `.env`/Config) and sent in the boot manifest — so the native path serves the same
 /// origin/method policy the PHP `Cors` middleware would, never a divergent `*`.
@@ -1587,10 +1627,12 @@ fn parse_statm_rss_bytes(statm: &str, page_size: u64) -> Option<u64> {
 mod tests {
     use super::{
         bind_tcp_listener, buffer_request_body, encode_cookie_value, format_set_cookie,
-        init_project, native_cors_preflight_response, parse_statm_rss_bytes,
-        rate_limit_denied_response, RequestDurationHistogram, MAX_IN_MEMORY_REQUEST_BODY_BYTES,
+        init_project, inject_security_headers, native_cors_preflight_response,
+        parse_statm_rss_bytes, rate_limit_denied_response, RequestDurationHistogram,
+        MAX_IN_MEMORY_REQUEST_BODY_BYTES,
     };
     use axum::body::Body;
+    use axum::response::Response;
     use fium_transport::{BootCors, SetCookie};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tokio::time::Duration;
@@ -1712,6 +1754,25 @@ mod tests {
         );
         // X-RateLimit headers are only on allowed responses, not on 429.
         assert!(!response.headers().contains_key("x-ratelimit-remaining"));
+    }
+
+    #[test]
+    fn inject_security_headers_adds_the_standard_set() {
+        let mut response = Response::new(Body::empty());
+        inject_security_headers(&mut response);
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            headers.get("x-frame-options").and_then(|v| v.to_str().ok()),
+            Some("DENY")
+        );
+        assert!(headers.contains_key("referrer-policy"));
+        assert!(headers.contains_key("permissions-policy"));
     }
 
     #[test]

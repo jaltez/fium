@@ -36,6 +36,13 @@ return [
         'handler' => fn(Request $r) => Response::json(['ok' => true]),
     ],
 
+    // Security-headers probe: a route whose response headers Rust stamps natively when
+    // FIUM_NATIVE_SECURITY_HEADERS=1 (the PHP SecurityHeaders middleware then defers).
+    'GET /bench/secure' => [
+        'middleware' => ['security-headers'],
+        'handler' => fn(Request $r) => Response::json(['secure' => true]),
+    ],
+
     // Workload "preflight" — the PHP path (Before). Only reached when FIUM_NATIVE_CORS=0.
     // Produces the same 204 + CORS headers as the Rust path so the comparison isolates
     // *who serves it*, not *what is served*.

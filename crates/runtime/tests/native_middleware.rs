@@ -123,7 +123,11 @@ fn requests_total(port: u16) -> u64 {
 }
 
 /// Spawn the binary with the given native flags; wait until /healthz responds 200.
-fn spawn(native_cors: bool, native_ratelimit: bool) -> Option<(ServerGuard, u16)> {
+fn spawn(
+    native_cors: bool,
+    native_ratelimit: bool,
+    native_security_headers: bool,
+) -> Option<(ServerGuard, u16)> {
     if !php_available() || fium_bin().is_none() || bench_app().is_none() {
         return None;
     }
@@ -151,6 +155,9 @@ fn spawn(native_cors: bool, native_ratelimit: bool) -> Option<(ServerGuard, u16)
     if native_ratelimit {
         command.env("FIUM_NATIVE_RATELIMIT", "1");
     }
+    if native_security_headers {
+        command.env("FIUM_NATIVE_SECURITY_HEADERS", "1");
+    }
 
     let child = command.spawn().ok()?;
     let guard = ServerGuard { child: Some(child) };
@@ -172,7 +179,7 @@ fn spawn(native_cors: bool, native_ratelimit: bool) -> Option<(ServerGuard, u16)
 
 #[test]
 fn native_cors_preflight_is_served_without_php() {
-    let Some((_guard, port)) = spawn(true, false) else {
+    let Some((_guard, port)) = spawn(true, false, false) else {
         eprintln!("skipping: fium binary or php not available");
         return;
     };
@@ -210,7 +217,7 @@ fn native_cors_preflight_is_served_without_php() {
 
 #[test]
 fn native_rate_limit_enforces_exact_limit_and_protects_pool() {
-    let Some((_guard, port)) = spawn(false, true) else {
+    let Some((_guard, port)) = spawn(false, true, false) else {
         eprintln!("skipping: fium binary or php not available");
         return;
     };
@@ -239,4 +246,29 @@ fn native_rate_limit_enforces_exact_limit_and_protects_pool() {
         php_hits <= 1,
         "native rate limit must protect the PHP pool under a flood (php_hits={php_hits})"
     );
+}
+
+#[test]
+fn native_security_headers_are_stamped_by_rust() {
+    let Some((_guard, port)) = spawn(false, false, true) else {
+        eprintln!("skipping: fium binary or php not available");
+        return;
+    };
+
+    let response = http(port, "GET", "/bench/secure", &[]).expect("secure route response");
+    assert_eq!(response.status, 200);
+
+    let header = |name: &str| {
+        response
+            .headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    // The PHP SecurityHeaders middleware defers when FIUM_NATIVE_SECURITY_HEADERS=1, so
+    // these must come from Rust's response post-processing.
+    assert_eq!(header("x-content-type-options"), Some("nosniff"));
+    assert_eq!(header("x-frame-options"), Some("DENY"));
+    assert!(header("referrer-policy").is_some());
+    assert!(header("permissions-policy").is_some());
 }

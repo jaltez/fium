@@ -214,9 +214,47 @@ scripts/bench-native-ratelimit.sh
 3. ❌ **Wire protocol (binary framing)** — **investigated and deprioritized**: serialization is
    only ~11µs/req (~1–3% of end-to-end), so binary framing isn't worth a zero-dep hand-rolled
    protocol. See "Wire-protocol investigation" below.
-4. 👉 **Hybrid middleware engine** — now the priority: serve more request *classes* from Rust so
-   fewer requests cross the boundary at all (the 9×/8× wins came from eliminating the crossing,
-   not speeding it up).
+4. ⏳ **Hybrid middleware engine** — in progress. Three built-in middleware now run in Rust
+   (CORS preflight, rate-limit, security-headers), each gated per-feature and each with the PHP
+   side deferring when native. See "Hybrid middleware engine" below for the design + what
+   remains to make it a general mechanism.
+
+## Hybrid middleware engine (design + status)
+
+Goal: built-in middleware run in Rust (no PHP round-trip for their effect); only
+user-written middleware + the handler cross into PHP. Today this exists as **point
+solutions** — three specific middleware moved over — not yet a general engine.
+
+**Native middleware today** (each `FIUM_NATIVE_*`, off by default, PHP side defers):
+
+| Middleware | Path exercised | Effect |
+|---|---|---|
+| CORS preflight | short-circuit | `204` served from Rust; PHP never touched |
+| rate-limit | short-circuit + state | `429` from Rust; pool-wide counters; PHP pool protected under flood |
+| security-headers | response-mutation | headers stamped on the response in Rust; PHP middleware is a no-op |
+
+**Two middleware shapes, both now demonstrated:**
+- *Short-circuit* — Rust answers before PHP (preflight, 429, and the easy next ones: `require-json`
+  406, a `health`-style fixed response). These give the big wins (eliminate the crossing).
+- *Response-mutation* — Rust post-processes the PHP response (security headers, the
+  `X-RateLimit-*` stamps). Smaller per-request win, but applies to every matching route.
+
+**What remains to make it a general engine** (the substantive architectural work):
+
+1. **Contract split.** Today Rust runs native middleware *and* PHP still runs the full chain
+   (the PHP middleware just no-op when its native flag is on). A true engine has PHP run **only
+   user middleware + handler** — the boot manifest must mark each middleware as built-in vs user,
+   and PHP's compiled chain must exclude the built-in ones. That removes the (cheap, but real)
+   PHP middleware hops for built-in middleware on every request.
+2. **A Rust `NativeMiddleware` trait + registry** so adding the next ones (`require-json`,
+   `powered-by`, CORS-on-actual-responses) is uniform instead of per-middleware bespoke code in
+   `dispatch`.
+3. **A unified toggle** (`FIUM_NATIVE=1` enabling all) instead of one flag per middleware.
+4. **Auth short-circuits** (`401`/`403`) are the high-value next target but need shared user/token
+   truth — the hardest piece, likely via a Rust-side cache fed by the PHP stores.
+
+The per-feature wins are real and measured (9× preflight, 8× rate-limit, pool-protected); the
+engine work above is about *generality and removing residual PHP hops*, not new perf cliffs.
 5. 🚫 **Session into Rust** — **decided against after research.** Unlike rate-limit (per-worker
    in-memory counters → incoherent), sessions already use **shared file/DB stores** with no
    per-worker state, so they're already coherent across the pool. Moving them to Rust

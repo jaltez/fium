@@ -37,6 +37,7 @@ pub struct RuntimeConfig {
     // never crosses into PHP. Env-only for now (`fium.toml` plumbing can follow).
     pub native_cors_preflight: bool,
     pub native_rate_limit: bool,
+    pub native_security_headers: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +311,7 @@ impl RuntimeConfig {
             trusted_proxies: TrustedProxies::from_env(),
             native_cors_preflight: native_bool("FIUM_NATIVE_CORS"),
             native_rate_limit: native_bool("FIUM_NATIVE_RATELIMIT"),
+            native_security_headers: native_bool("FIUM_NATIVE_SECURITY_HEADERS"),
         }
     }
 
@@ -393,6 +395,7 @@ impl RuntimeConfig {
             trusted_proxies: defaults.trusted_proxies,
             native_cors_preflight: defaults.native_cors_preflight,
             native_rate_limit: defaults.native_rate_limit,
+            native_security_headers: defaults.native_security_headers,
         }
     }
 
@@ -523,6 +526,7 @@ mod tests {
             trusted_proxies: TrustedProxies::None,
             native_cors_preflight: false,
             native_rate_limit: false,
+            native_security_headers: false,
         };
 
         let toml = TomlConfig {

@@ -15,6 +15,12 @@ final class SecurityHeaders implements Middleware
 {
     public function handle(Request $request, callable $next): Response
     {
+        // When the Rust runtime stamps these headers natively (FIUM_NATIVE_SECURITY_HEADERS),
+        // defer — Rust applies them to the response without this PHP middleware running.
+        if (\Fium\Config::bool('FIUM_NATIVE_SECURITY_HEADERS')) {
+            return $next($request);
+        }
+
         return $next($request)
             ->withHeader('X-Content-Type-Options', 'nosniff')
             ->withHeader('X-Frame-Options', 'DENY')
