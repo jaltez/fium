@@ -192,13 +192,13 @@ Tracked from code review. Both toggles ship **off by default**, so these are lat
 - **[fixed] Purge evicted non-expired buckets** (`ratelimit.rs`) — purge now uses each bucket's
   own window, so long-window routes (e.g. `ratelimit:N,86400`) are no longer under-limited once
   the map exceeds 4096 entries.
-- **[hardening] Single global `Mutex`** (`ratelimit.rs`) — serializes all checks; shard by IP
-  hash or move to a lock-free map under real load.
-- **[hardening] O(n) purge under the lock** — runs every check past the 4096 threshold; an
-  attacker churning IPs can contention-DoS the limiter. Use a periodic background sweep.
-- **[coverage] No automated dispatch integration tests** — the CORS 204, rate-limit 429, and
-  `X-RateLimit-*` header injection are exercised only manually. Extend `php_worker_e2e.rs` to
-  cover the native paths before default-on.
+- **[fixed] Single global `Mutex`** (`ratelimit.rs`) — state is now sharded across 16
+  mutexes keyed by `(route, ip)` hash, so each request locks only its shard.
+- **[fixed] O(n) purge under the lock** — the memory-bounding `retain()` is now time-gated
+  (at most once per minute per shard, only past the threshold), so a high-churn IP set can't
+  turn the limiter into a per-request DoS.
+- **[fixed] No automated dispatch integration tests** — `tests/native_middleware.rs` now
+  boots the real binary and asserts the native CORS 204 / rate-limit 429 + pool protection.
 
 ## Reproduce
 

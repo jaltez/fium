@@ -7,6 +7,7 @@
 //! no longer load the PHP pool.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -55,11 +56,33 @@ pub enum Allow {
 
 struct Bucket {
     count: u32,
-    /// This bucket's window length, captured from the route config. Stored per-bucket so
-    /// the purge below evicts on the route's own window — a `ratelimit:N,86400` bucket
-    /// must not be dropped after 300s, its window hasn't elapsed yet.
+    /// This bucket's window length, captured at creation. Stored per-bucket so the purge
+    /// below evicts on the route's own window — a `ratelimit:N,86400` bucket must not be
+    /// dropped after 300s, its window hasn't elapsed yet.
     window: Duration,
     window_start: Instant,
+}
+
+/// Shard size. 16 shards keep lock contention low (each request locks only its shard)
+/// while bounding the worst-case purge scan to one shard at a time.
+const SHARDS: usize = 16;
+/// Purge is time-gated per shard so a high-churn IP set can't turn the limiter into an
+/// O(n) per-request DoS: even past this size, retain() runs at most once per minute.
+const PURGE_THRESHOLD: usize = 4096;
+const PURGE_INTERVAL: Duration = Duration::from_secs(60);
+
+struct Shard {
+    buckets: HashMap<(String, String), Bucket>,
+    last_purge: Instant,
+}
+
+impl Shard {
+    fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            last_purge: Instant::now(),
+        }
+    }
 }
 
 /// Pool-wide rate limiter. Counters are keyed by `(route_name, ip)` — an intentional
@@ -67,42 +90,53 @@ struct Bucket {
 /// counter across routes with different limits. For a single route the two are
 /// observationally identical.
 ///
-/// NOTE(world-b prod-readiness): a single `Mutex` serializes every check across all routes
-/// and IPs — fine for the spike, but a contention point under real load. Shard by IP hash
-/// or move to a lock-free concurrent map before this becomes default-on. Also in-memory
-/// only: independent counters per Fium instance (no multi-instance / Redis backend yet).
-#[derive(Default)]
+/// State is sharded across `SHARDS` mutexes (keyed by hash) for concurrency, and the
+/// memory-bounding purge is time-gated rather than per-request. Still in-memory only:
+/// independent counters per Fium instance (no multi-instance / Redis backend yet).
 pub struct RateLimiter {
-    buckets: Mutex<HashMap<(String, String), Bucket>>,
+    shards: [Mutex<Shard>; SHARDS],
 }
 
 impl RateLimiter {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(Shard::new())),
+        }
+    }
+
+    fn shard_index(&self, route: &str, ip: &str) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        route.hash(&mut hasher);
+        ip.hash(&mut hasher);
+        (hasher.finish() as usize) % SHARDS
     }
 
     /// Account one request for `(route_name, ip)` against `cfg`. Lock is held only for
     /// the duration of this synchronous call (no await while held).
     pub fn check(&self, route_name: &str, ip: &str, cfg: &RateLimitConfig) -> Allow {
         let now = Instant::now();
-        let mut buckets = self.buckets.lock().expect("rate limiter mutex poisoned");
+        let key = (route_name.to_string(), ip.to_string());
+        let index = self.shard_index(route_name, ip);
+        let mut shard = self.shards[index]
+            .lock()
+            .expect("rate limiter mutex poisoned");
 
-        // Bound memory: if the table is large, drop buckets whose own window has elapsed.
-        // NOTE(world-b prod-readiness): this O(n) retain runs under the lock on every check
-        // past the threshold — an attacker churning >4096 IPs can turn the limiter into a
-        // contention/CPU DoS. Replace with a periodic background sweep or a size-bounded
-        // concurrent map (see BENCHMARKS.md).
-        if buckets.len() > 4096 {
-            buckets.retain(|_, bucket| now.duration_since(bucket.window_start) < bucket.window);
+        // Bound memory: if this shard is large, drop buckets whose own window has elapsed
+        // — but only once per PURGE_INTERVAL, never every request.
+        if shard.buckets.len() > PURGE_THRESHOLD
+            && now.duration_since(shard.last_purge) >= PURGE_INTERVAL
+        {
+            shard
+                .buckets
+                .retain(|_, bucket| now.duration_since(bucket.window_start) < bucket.window);
+            shard.last_purge = now;
         }
 
-        let bucket = buckets
-            .entry((route_name.to_string(), ip.to_string()))
-            .or_insert(Bucket {
-                count: 0,
-                window: cfg.window,
-                window_start: now,
-            });
+        let bucket = shard.buckets.entry(key).or_insert(Bucket {
+            count: 0,
+            window: cfg.window,
+            window_start: now,
+        });
 
         // Reset the window if it has elapsed; refresh the stored window in case the route
         // config changed (dev reload).
@@ -127,6 +161,12 @@ impl RateLimiter {
                 remaining,
             }
         }
+    }
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -249,5 +289,28 @@ mod tests {
             limiter.check("r", "1.2.3.4", &cfg),
             Allow::Allowed { .. }
         ));
+    }
+
+    #[test]
+    fn shards_distribute_keys_but_behave_consistently() {
+        // Sharding is an internal detail; behavior across many route/ip pairs must be the
+        // same as a single map (each (route,ip) has its own coherent bucket).
+        let limiter = RateLimiter::new();
+        let cfg = RateLimitConfig {
+            max: 1,
+            window: Duration::from_secs(60),
+        };
+
+        for i in 0..200 {
+            let route = format!("route{i}");
+            assert!(matches!(
+                limiter.check(&route, "9.9.9.9", &cfg),
+                Allow::Allowed { .. }
+            ));
+            assert!(matches!(
+                limiter.check(&route, "9.9.9.9", &cfg),
+                Allow::Denied { .. }
+            ));
+        }
     }
 }
