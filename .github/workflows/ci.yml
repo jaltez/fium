@@ -15,7 +15,7 @@ jobs:
     name: Rust (fmt, clippy, test)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The runtime's e2e/contract tests spawn a real PHP worker, so install PHP too.
       - uses: shivammathur/setup-php@v2
         with:
@@ -40,12 +40,14 @@ jobs:
       run:
         working-directory: php
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
           extensions: mbstring, pdo, pdo_sqlite
           coverage: none
       - uses: ramsey/composer-install@v3
+        with:
+          working-directory: php
       - name: composer check (phpstan + phpunit)
         run: composer check
