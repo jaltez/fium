@@ -132,8 +132,6 @@ return [
 ];
 ```
 
-**Legacy verbose format** — indexed array with explicit method/path keys (still supported).
-
 Route names are auto-generated from method and path when using the concise format (e.g. `GET /hello/{name}` becomes `get_hello_name`), but array-style concise routes may override this with a `name` key.
 
 The Rust runtime uses the boot route manifest to build its route table and perform path matching. It passes the `matched_route` name to PHP so the worker can dispatch to the correct handler.

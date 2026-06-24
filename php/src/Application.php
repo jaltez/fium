@@ -219,12 +219,11 @@ final class Application
     }
 
     /**
-     * Parse routes from either concise or verbose format.
+     * Parse routes in concise format or as named groups.
      *
      * Concise: 'GET /path' => fn(Request $r) => Response::json([...])
      * Concise: 'GET /path' => ['middleware' => [...], 'name' => 'route_name', 'handler' => fn(...) => ...]
      * Concise: 'GET /path' => 'App\\Handlers\\MyHandler'
-     * Verbose: ['method' => 'GET', 'path' => '/', 'name' => '...', 'handler' => '...', 'middleware' => [...]]
      * Group:   'name' => ['prefix' => '/api', 'middleware' => [...], 'routes' => [...]]
      *
      * @param array<mixed> $rawRoutes
@@ -234,10 +233,7 @@ final class Application
     private function parseRoutes(array $rawRoutes, string $prefix = '', array $middleware = []): void
     {
         foreach ($rawRoutes as $key => $value) {
-            if (is_int($key) && is_array($value) && isset($value['method'], $value['path'])) {
-                // Verbose format (legacy): numeric index, value is a route definition array
-                $this->registerVerboseRoute($value, $prefix, $middleware);
-            } elseif (is_string($key) && is_array($value) && isset($value['routes'])) {
+            if (is_string($key) && is_array($value) && isset($value['routes'])) {
                 // Group: 'name' => ['prefix' => '/api', 'middleware' => [...], 'routes' => [...]]
                 $groupPrefix = $prefix . (string) ($value['prefix'] ?? '');
                 $groupMiddleware = $this->expandMiddlewareList(array_merge($middleware, (array) ($value['middleware'] ?? [])));
@@ -246,26 +242,9 @@ final class Application
                 // Concise format: 'METHOD /path' => handler
                 $this->registerConciseRoute($key, $value, $prefix, $middleware);
             } else {
-                throw new \RuntimeException("Invalid route definition at index {$key}.");
+                throw new \RuntimeException("Invalid route definition at key '{$key}'.");
             }
         }
-    }
-
-    /**
-     * @param array<string, mixed> $route
-     * @param list<string> $groupMiddleware
-     */
-    private function registerVerboseRoute(array $route, string $prefix = '', array $groupMiddleware = []): void
-    {
-        if (!isset($route['handler'])) {
-            throw new \RuntimeException('Verbose route definitions must include a handler.');
-        }
-
-        $method = strtoupper((string) $route['method']);
-        $path = $prefix . (string) $route['path'];
-        $name = (string) ($route['name'] ?? $this->generateRouteName($method, $path));
-        $middleware = $this->expandMiddlewareList(array_merge($groupMiddleware, (array) ($route['middleware'] ?? [])));
-        $this->registerRoute($method, $path, $name, $middleware, $route['handler']);
     }
 
     /**
