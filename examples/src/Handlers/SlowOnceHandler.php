@@ -12,7 +12,7 @@ final class SlowOnceHandler implements Handler
 {
     public function __invoke(Request $request): Response
     {
-        $baseDir = $request->attribute('base_dir') ?? dirname(__DIR__, 2);
+        $baseDir = $request->baseDir() ?? dirname(__DIR__, 2);
         $flagDirectory = $baseDir . '/storage/runtime';
         $flagPath = $flagDirectory . '/slow-once.flag';
 

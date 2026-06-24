@@ -15,7 +15,7 @@ final class HomeHandler implements Handler
         return Response::json([
             'ok' => true,
             'message' => 'Welcome to Fium.',
-            'route' => $request->attribute('route_name', $request->matchedRoute()),
+            'route' => $request->matchedRoute(),
             'path' => $request->path(),
         ]);
     }

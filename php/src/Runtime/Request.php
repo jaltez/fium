@@ -409,6 +409,17 @@ final class Request
     }
 
     /**
+     * The application base directory (where app.php lives), or null if not set. Useful for
+     * handlers that need to locate storage/assets relative to the app.
+     */
+    public function baseDir(): ?string
+    {
+        $baseDir = $this->attribute('base_dir');
+
+        return is_string($baseDir) ? $baseDir : null;
+    }
+
+    /**
      * Validate request input against rules.
      *
      * @param array<string, string> $rules e.g. ['email' => 'required|email', 'name' => 'required|min:2']
