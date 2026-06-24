@@ -1,6 +1,6 @@
 use crate::ratelimit::{parse_rate_limit_alias, RateLimitConfig};
 use fium_transport::{BootCors, BootRoute};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -34,9 +34,9 @@ pub struct RouteTable {
     /// Routes keyed by HTTP method for O(1) lookup per method.
     by_method: HashMap<String, MethodRoutes>,
     routes: Vec<ListedRoute>,
-    /// Static paths that carry the `cors` middleware, so Rust can answer
-    /// OPTIONS preflights itself without a PHP round-trip.
-    cors_paths: HashSet<String>,
+    /// Segment patterns for routes that carry the `cors` middleware, so Rust can answer
+    /// OPTIONS preflights itself (static or parameterized) without a PHP round-trip.
+    cors_routes: Vec<Vec<RouteSegment>>,
     /// Routes that declare a `ratelimit` directive, with the parsed config, so Rust
     /// can enforce the limit pool-wide without a PHP round-trip.
     rate_limits: HashMap<String, RateLimitConfig>,
@@ -67,7 +67,7 @@ impl RouteTable {
 
         let mut by_method: HashMap<String, MethodRoutes> = HashMap::new();
         let mut routes = Vec::with_capacity(boot_routes.len());
-        let mut cors_paths = HashSet::new();
+        let mut cors_routes = Vec::new();
         let mut rate_limits = HashMap::new();
 
         for br in boot_routes {
@@ -76,9 +76,10 @@ impl RouteTable {
             let name = br.name;
             let method_routes = by_method.entry(method.clone()).or_default();
 
-            // Record static paths protected by CORS so preflights can be served from Rust.
-            if is_static_path(&path) && br.middleware.iter().any(|m| m == "cors") {
-                cors_paths.insert(path.clone());
+            // Record CORS-protected routes (static or parameterized) so preflights can be
+            // served from Rust.
+            if br.middleware.iter().any(|m| m == "cors") {
+                cors_routes.push(parse_segments_owned(&path));
             }
 
             // Parse the first ratelimit directive on the route, if any.
@@ -119,7 +120,7 @@ impl RouteTable {
         Ok(Self {
             by_method,
             routes,
-            cors_paths,
+            cors_routes,
             rate_limits,
             cors,
         })
@@ -180,12 +181,13 @@ impl RouteTable {
         None
     }
 
-    /// Whether `path` is a static route protected by the `cors` middleware, meaning
-    /// Rust can answer an OPTIONS preflight for it without dispatching to PHP.
-    /// Note: dynamic (parameterized) cors paths are not matched here yet — see
-    /// BENCHMARKS.md — so this is currently exact-path only.
+    /// Whether `path` is protected by the `cors` middleware (static or parameterized),
+    /// meaning Rust can answer an OPTIONS preflight for it without dispatching to PHP.
     pub fn cors_preflight_target(&self, path: &str) -> bool {
-        self.cors_paths.contains(path)
+        let actual = split_segments(path);
+        self.cors_routes
+            .iter()
+            .any(|pattern| segments_match(pattern, &actual))
     }
 
     /// The rate-limit directive declared on `route_name`, if any, so Rust can enforce
@@ -259,6 +261,18 @@ fn extract_param_name(segment: &str) -> Option<&str> {
         .strip_prefix('{')
         .and_then(|value| value.strip_suffix('}'))
         .filter(|value| !value.is_empty())
+}
+
+/// Whether a route pattern (from `parse_segments_owned`) matches actual path segments.
+/// Static segments must match exactly; `{param}` segments match any single segment.
+fn segments_match(pattern: &[RouteSegment], actual: &[&str]) -> bool {
+    if pattern.len() != actual.len() {
+        return false;
+    }
+    pattern.iter().zip(actual).all(|(pseg, aseg)| match pseg {
+        RouteSegment::Static(segment) => segment == aseg,
+        RouteSegment::Param(_) => true,
+    })
 }
 
 #[cfg(test)]
@@ -365,17 +379,31 @@ mod tests {
     }
 
     #[test]
-    fn cors_preflight_target_only_for_cors_static_paths() {
+    fn cors_preflight_target_matches_static_and_dynamic_cors_paths() {
         let t = table_with_middleware(&[
             ("POST", "/bench/cors", "bench_cors", &["cors"]),
             ("GET", "/bench/plain", "bench_plain", &[]),
             ("POST", "/api/{id}", "api_dynamic", &["cors"]),
+            (
+                "DELETE",
+                "/api/{id}/items/{itemId}",
+                "api_nested",
+                &["cors"],
+            ),
         ]);
 
+        // Static cors path.
         assert!(t.cors_preflight_target("/bench/cors"));
+        // Plain path (no cors).
         assert!(!t.cors_preflight_target("/bench/plain"));
-        // Dynamic cors paths are not yet matched (documented limitation).
-        assert!(!t.cors_preflight_target("/api/42"));
+        // Dynamic cors path now matches any concrete value.
+        assert!(t.cors_preflight_target("/api/42"));
+        // Nested dynamic cors path.
+        assert!(t.cors_preflight_target("/api/42/items/7"));
+        // Right segment count, but not a cors route.
+        assert!(!t.cors_preflight_target("/api/42/items/7/extra"));
+        // Different path of the same arity as a cors route.
+        assert!(!t.cors_preflight_target("/other/42"));
     }
 
     #[test]
