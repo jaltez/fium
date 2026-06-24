@@ -24,6 +24,7 @@ spl_autoload_register(static function (string $class): void {
 });
 
 use Fium\Application;
+use Fium\Runtime\Response;
 
 $routesPath = $argv[1] ?? __DIR__ . '/routes.php';
 
@@ -178,6 +179,25 @@ while (true) {
 
     $response = $application->handleWorkerRequest($request);
     $t3 = hrtime(true);
+
+    // Streaming responses can't be encoded into one frame — drive stream_open/chunk/end.
+    if ($response instanceof Response && $response->isStreaming()) {
+        $response->emitTo(
+            static fn (string $json) => write_frame_raw($stdout, $json),
+            isset($request['request_id']) ? (string) $request['request_id'] : null,
+        );
+        fflush($stdout);
+
+        if ($PROFILE) {
+            // Only read/decode/dispatch are meaningful for a stream (no single encode/write).
+            $pAcc['n']++;
+            $pAcc['read'] += (int) ($t1 - $t0);
+            $pAcc['decode'] += (int) ($t2 - $t1);
+            $pAcc['dispatch'] += (int) ($t3 - $t2);
+            emit_profile_summary_if_due();
+        }
+        continue;
+    }
 
     $payload = json_encode($response, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     $t4 = hrtime(true);

@@ -187,9 +187,10 @@ final class Application
 
     /**
      * @param array<string, mixed> $workerRequest
-     * @return array<string, mixed>
+     * @return array<string, mixed>|Response A plain worker-response array, or a streaming
+     *     Response the worker must drive itself (see Response::emitTo).
      */
-    public function handleWorkerRequest(array $workerRequest): array
+    public function handleWorkerRequest(array $workerRequest): array|Response
     {
         $requestId = isset($workerRequest['request_id']) ? (string) $workerRequest['request_id'] : null;
         $routeName = isset($workerRequest['matched_route']) ? (string) $workerRequest['matched_route'] : '';
@@ -211,6 +212,12 @@ final class Application
 
             $chain = $this->routeMap[$routeName]['_chain'];
             $response = $chain($request);
+
+            // A streaming response can't be encoded into one frame — hand it back so the
+            // worker drives stream_open/chunk/end itself.
+            if ($response->isStreaming()) {
+                return $response;
+            }
 
             return $response->toWorkerResponse($requestId);
         } catch (\Throwable $throwable) {

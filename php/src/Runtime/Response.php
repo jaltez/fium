@@ -12,12 +12,14 @@ final class Response
     /**
      * @param array<string, list<string>> $headers
      * @param array<string, string>|null $error
+     * @param ?\Closure(Stream): void $stream Emitter for a streaming response.
      */
     private function __construct(
         private int $status,
         private array $headers,
         private ?string $body,
         private ?array $error = null,
+        private ?\Closure $stream = null,
     ) {
     }
 
@@ -65,6 +67,52 @@ final class Response
     public static function empty(int $status = 204): self
     {
         return new self($status, [], null);
+    }
+
+    /**
+     * A streaming response. $emit receives a {@see Stream} it writes chunks to as they're
+     * produced; the runtime relays them to the client incrementally (no buffering). Status
+     * and headers apply to the opening frame — set Content-Type to text/event-stream for SSE.
+     *
+     * @param callable(Stream): void $emit
+     * @param array<string, list<string>> $headers
+     */
+    public static function stream(callable $emit, int $status = 200, array $headers = []): self
+    {
+        $closure = $emit instanceof \Closure ? $emit : \Closure::fromCallable($emit);
+
+        return new self($status, $headers, null, null, $closure);
+    }
+
+    public function isStreaming(): bool
+    {
+        return $this->stream !== null;
+    }
+
+    /**
+     * Drive a streaming response over the wire: write the open frame (status/headers/cookies),
+     * invoke the emitter (which writes chunk frames), then write the end frame.
+     *
+     * @param \Closure(string): void $writeFrame writes one length-prefixed frame (JSON payload).
+     */
+    public function emitTo(\Closure $writeFrame, ?string $requestId): void
+    {
+        ($writeFrame)(json_encode([
+            'type' => 'stream_open',
+            'request_id' => $requestId,
+            'status' => $this->status,
+            'headers' => $this->headers,
+            'cookies' => $this->cookies,
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
+
+        if ($this->stream !== null) {
+            ($this->stream)(new Stream($writeFrame, (string) $requestId));
+        }
+
+        ($writeFrame)(json_encode([
+            'type' => 'stream_end',
+            'request_id' => $requestId,
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
     }
 
     public static function fromThrowable(\Throwable $throwable, ?string $requestId = null, bool $debug = false): self
