@@ -1168,14 +1168,23 @@ fn init_project(directory: &PathBuf) -> anyhow::Result<()> {
     }
 
     std::fs::write(&app_php, APP_PHP_TEMPLATE)?;
+    std::fs::write(dir.join("README.md"), SCAFFOLD_README)?;
     std::fs::create_dir_all(dir.join("public"))?;
     std::fs::write(
         dir.join(".gitignore"),
         "/storage/\n/.fium/\n/.env\n/vendor/\n",
     )?;
+    // An actual .env so `fium serve` boots out of the box (every app boots the token
+    // service, which needs either FIUM_DEBUG or a real FIUM_API_TOKEN_SECRET).
+    std::fs::write(dir.join(".env"), "FIUM_DEBUG=true\n")?;
     std::fs::write(
         dir.join(".env.example"),
-        "FIUM_DEBUG=true\n# FIUM_API_TOKEN_SECRET=change-me\n# FIUM_SESSION_DRIVER=file\n",
+        "# Copy to .env and adjust. FIUM_DEBUG=true is fine for local dev; for production\n\
+         # set a real secret instead.\n\
+         FIUM_DEBUG=true\n\
+         # FIUM_API_TOKEN_SECRET=change-me-to-a-long-random-string\n\
+         # FIUM_SESSION_DRIVER=file\n\
+         # FIUM_DB_DSN=sqlite:storage/app.db\n",
     )?;
     std::fs::create_dir_all(dir.join("storage/sessions"))?;
     std::fs::create_dir_all(dir.join("storage/runtime"))?;
@@ -1186,9 +1195,11 @@ fn init_project(directory: &PathBuf) -> anyhow::Result<()> {
         dir.display()
     );
     eprintln!();
-    eprintln!("  Get started:");
+    eprintln!("  \x1b[1mGet started:\x1b[0m");
     eprintln!("    cd {}", directory.display());
-    eprintln!("    fium serve");
+    eprintln!("    \x1b[2mfium serve\x1b[0m            # http://127.0.0.1:3000");
+    eprintln!("    \x1b[2mfium dev\x1b[0m              # serve + reload on PHP changes");
+    eprintln!("    \x1b[2mfium routes\x1b[0m            # list routes + middleware");
     eprintln!();
 
     Ok(())
@@ -1198,15 +1209,68 @@ const APP_PHP_TEMPLATE: &str = r#"<?php
 
 declare(strict_types=1);
 
+// A Fium app returns an array of routes from app.php. Each entry is either a concise
+// "'METHOD /path' => handler" pair, or a named group with a shared prefix + middleware.
+// A handler is a closure (Request $r): Response (or a class-string). Run `fium serve`.
+
+use Fium\Runtime\Request;
+use Fium\Runtime\Response;
+
 return [
-    'GET /' => fn($request) => \Fium\Runtime\Response::json([
-        'message' => 'Hello from fium!',
+    // Concise route + closure handler. Path params in {braces} are bound on the Request.
+    'GET /' => fn(Request $r) => Response::json([
+        'name' => 'my-fium-app',
+        'status' => 'ok',
     ]),
 
-    'GET /hello/{name}' => fn($request) => \Fium\Runtime\Response::json([
-        'message' => 'Hello, ' . $request->routeParam('name') . '!',
+    'GET /hello/{name}' => fn(Request $r) => Response::json([
+        'message' => 'Hello, ' . $r->routeParam('name') . '!',
     ]),
+
+    // Response::html / Response::redirect / Response::empty are available too.
+    'GET /welcome' => fn(Request $r) => Response::html('<h1>It works.</h1>'),
+
+    // A group shares a prefix and middleware across its routes.
+    // Built-in middleware: cors, ratelimit:60, start-session, verify-csrf, auth-bearer,
+    // auth-session, role:admin, require-json, secure, powered-by. See `fium routes`.
+    'api' => [
+        'prefix' => '/api',
+        'middleware' => ['require-json'],
+        'routes' => [
+            'GET /time' => fn(Request $r) => Response::json(['now' => gmdate('c')]),
+        ],
+    ],
 ];
+"#;
+
+const SCAFFOLD_README: &str = r#"# my-fium-app
+
+A [Fium](https://github.com/jaltez/fium) app — a fast PHP runtime powered by Rust.
+
+## Run
+
+```bash
+fium serve            # http://127.0.0.1:3000
+fium dev              # serve + reload on PHP changes
+```
+
+## Explore
+
+```bash
+fium routes           # list every route with its middleware chain
+fium explain GET /hello/World
+```
+
+## Layout
+
+- `app.php` — your routes and handlers (the whole app starts here).
+- `public/` — static files served as-is.
+- `.env` — config. `FIUM_DEBUG=true` here; set `FIUM_API_TOKEN_SECRET` for production.
+- `storage/` — sessions, cache, runtime data (gitignored).
+
+Routes return JSON/HTML/redirect/empty responses via `Fium\Runtime\Response`. Middleware
+and groups are declared per-route in `app.php`. See the project docs for auth, sessions,
+database, cache, and validation.
 "#;
 
 async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
@@ -1522,8 +1586,8 @@ fn parse_statm_rss_bytes(statm: &str, page_size: u64) -> Option<u64> {
 mod tests {
     use super::{
         bind_tcp_listener, buffer_request_body, encode_cookie_value, format_set_cookie,
-        native_cors_preflight_response, parse_statm_rss_bytes, rate_limit_denied_response,
-        RequestDurationHistogram, MAX_IN_MEMORY_REQUEST_BODY_BYTES,
+        init_project, native_cors_preflight_response, parse_statm_rss_bytes,
+        rate_limit_denied_response, RequestDurationHistogram, MAX_IN_MEMORY_REQUEST_BODY_BYTES,
     };
     use axum::body::Body;
     use fium_transport::{BootCors, SetCookie};
@@ -1607,6 +1671,31 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("600")
         );
+    }
+
+    #[test]
+    fn init_project_scaffolds_expected_files() {
+        let dir = std::env::temp_dir().join(format!("fium-init-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        init_project(&dir).expect("init should scaffold the project");
+
+        for file in ["app.php", "README.md", ".env", ".env.example", ".gitignore"] {
+            assert!(dir.join(file).is_file(), "scaffold should include {file}");
+        }
+        for subdir in ["public", "storage/sessions", "storage/runtime"] {
+            assert!(
+                dir.join(subdir).is_dir(),
+                "scaffold should include {subdir}/"
+            );
+        }
+
+        // app.php shows the JSON helper; .env enables debug so the scaffold boots as-is.
+        let app = std::fs::read_to_string(dir.join("app.php")).unwrap();
+        assert!(app.contains("Response::json"));
+        let env = std::fs::read_to_string(dir.join(".env")).unwrap();
+        assert!(env.contains("FIUM_DEBUG=true"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
