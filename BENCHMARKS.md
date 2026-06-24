@@ -217,7 +217,12 @@ scripts/bench-native-ratelimit.sh
 4. 👉 **Hybrid middleware engine** — now the priority: serve more request *classes* from Rust so
    fewer requests cross the boundary at all (the 9×/8× wins came from eliminating the crossing,
    not speeding it up).
-5. ⬜ **Session into Rust** — same shared-state pattern as rate-limit, if/when needed.
+5. 🚫 **Session into Rust** — **decided against after research.** Unlike rate-limit (per-worker
+   in-memory counters → incoherent), sessions already use **shared file/DB stores** with no
+   per-worker state, so they're already coherent across the pool. Moving them to Rust
+   in-memory would *lose* persistence, *add* an IPC round-trip per request, and require
+   porting flash/regenerate/remember-me — for no gain. Leave sessions in PHP (file/PDO),
+   with Redis a future option if multi-instance is needed.
 
 ---
 
