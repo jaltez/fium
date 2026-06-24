@@ -26,6 +26,7 @@ struct ListedRoute {
     method: String,
     path: String,
     name: String,
+    middleware: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,7 +106,12 @@ impl RouteTable {
                     });
             }
 
-            routes.push(ListedRoute { method, path, name });
+            routes.push(ListedRoute {
+                method,
+                path,
+                name,
+                middleware: br.middleware,
+            });
         }
 
         routes.sort_by(|left, right| left.name.cmp(&right.name));
@@ -192,6 +198,29 @@ impl RouteTable {
     /// the worker didn't advertise any (older worker).
     pub fn cors(&self) -> Option<&BootCors> {
         self.cors.as_ref()
+    }
+
+    /// All routes with their declared middleware, sorted by name — for `fium routes`.
+    pub fn list_detailed(&self) -> Vec<(&str, &str, &str, &[String])> {
+        self.routes
+            .iter()
+            .map(|route| {
+                (
+                    route.method.as_str(),
+                    route.path.as_str(),
+                    route.name.as_str(),
+                    route.middleware.as_slice(),
+                )
+            })
+            .collect()
+    }
+
+    /// The declared middleware chain for `route_name`, if present — for `fium explain`.
+    pub fn middleware_for(&self, route_name: &str) -> Option<&[String]> {
+        self.routes
+            .iter()
+            .find(|route| route.name == route_name)
+            .map(|route| route.middleware.as_slice())
     }
 }
 

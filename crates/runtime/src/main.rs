@@ -103,6 +103,24 @@ enum Cli {
         #[arg(default_value = ".")]
         directory: PathBuf,
     },
+
+    /// List the routes declared by the app (boots it — same env as `serve`)
+    Routes {
+        /// Path to the PHP application file
+        #[arg(default_value = "app.php")]
+        app: PathBuf,
+    },
+
+    /// Resolve a request and show the middleware chain that would run
+    Explain {
+        /// HTTP method, e.g. GET
+        method: String,
+        /// Request path, e.g. /admin or /users/42
+        path: String,
+        /// Path to the PHP application file
+        #[arg(default_value = "app.php")]
+        app: PathBuf,
+    },
 }
 
 #[derive(Clone)]
@@ -220,7 +238,124 @@ async fn main() -> anyhow::Result<()> {
             dev_serve(app_path, app_dir, cfg).await
         }
         Cli::Init { directory } => init_project(&directory),
+        Cli::Routes { app } => routes_command(app).await,
+        Cli::Explain { method, path, app } => explain_command(method, path, app).await,
     }
+}
+
+/// Boot one PHP worker just long enough to read the route manifest. Used by the
+/// `routes` and `explain` introspection commands. Same env requirements as `serve`.
+async fn boot_route_table(app: &PathBuf) -> anyhow::Result<RouteTable> {
+    let (app_path, app_dir) = resolve_app_path(app)?;
+    let mut cfg = RuntimeConfig::load(&app_dir, None, None, None, None, None, false);
+    // Quiet: only surface problems (e.g. a boot error), not the normal info logs.
+    cfg.log_level = "warn".to_string();
+    init_logging(&cfg);
+
+    let lib_dir = embed::extract_php_lib(&app_path)?;
+    let worker_entrypoint = lib_dir.join("worker.php");
+    let pool = WorkerPool::new(
+        cfg.php_binary.clone(),
+        worker_entrypoint.to_string_lossy().to_string(),
+        app_path.to_string_lossy().to_string(),
+        1, // one worker is enough to read the route manifest
+        cfg.max_requests,
+        cfg.worker_timeout_ms,
+        cfg.tuning.worker_boot_timeout_ms,
+    );
+
+    pool.boot().await.map_err(anyhow::Error::from)
+}
+
+async fn routes_command(app: PathBuf) -> anyhow::Result<()> {
+    let table = boot_route_table(&app).await?;
+    let routes = table.list_detailed();
+    if routes.is_empty() {
+        println!("(no routes declared)");
+        return Ok(());
+    }
+
+    let mw = routes
+        .iter()
+        .map(|(m, _, _, _)| m.len())
+        .max()
+        .unwrap_or(0)
+        .max(6);
+    let pw = routes
+        .iter()
+        .map(|(_, p, _, _)| p.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let nw = routes
+        .iter()
+        .map(|(_, _, n, _)| n.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+
+    println!(
+        "{:mw$}  {:pw$}  {:nw$}  middleware",
+        "method",
+        "path",
+        "name",
+        mw = mw,
+        pw = pw,
+        nw = nw,
+    );
+    for (method, path, name, middleware) in &routes {
+        let chain = if middleware.is_empty() {
+            "(none)".to_string()
+        } else {
+            middleware.join(" -> ")
+        };
+        println!(
+            "{:mw$}  {:pw$}  {:nw$}  {}",
+            method,
+            path,
+            name,
+            chain,
+            mw = mw,
+            pw = pw,
+            nw = nw,
+        );
+    }
+    Ok(())
+}
+
+async fn explain_command(method: String, path: String, app: PathBuf) -> anyhow::Result<()> {
+    let table = boot_route_table(&app).await?;
+    let method = method.to_ascii_uppercase();
+    let matched = table
+        .match_route(&method, &path)
+        .ok_or_else(|| anyhow::anyhow!("no route matches {method} {path}"))?;
+
+    let params: Vec<String> = matched
+        .params
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    let middleware = table.middleware_for(&matched.route_name).unwrap_or(&[]);
+
+    println!("{method} {path}");
+    println!("  route:      {}", matched.route_name);
+    println!(
+        "  params:     {}",
+        if params.is_empty() {
+            "(none)".to_string()
+        } else {
+            params.join(", ")
+        }
+    );
+    println!(
+        "  middleware: {}",
+        if middleware.is_empty() {
+            "(none)".to_string()
+        } else {
+            middleware.join(" -> ")
+        }
+    );
+    Ok(())
 }
 
 fn resolve_app_path(app: &PathBuf) -> anyhow::Result<(PathBuf, PathBuf)> {

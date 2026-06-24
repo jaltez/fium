@@ -133,6 +133,21 @@ Built-in middleware aliases:
 | `json` | `RequireJsonAccept` | Requires JSON Accept header |
 | `powered-by` | `AddPoweredByHeader` | Adds X-Fium-Middleware header |
 
+## Introspection
+
+The runtime can describe the app to you (and to coding agents) without serving traffic — handy for understanding middleware coverage and debugging routing. These commands boot the app, so they need the same env as `serve` (e.g. `FIUM_DEBUG=1` in development).
+
+```bash
+# List every route with its resolved middleware chain
+fium routes
+
+# Resolve a specific request: matched route, path params, and the middleware that runs
+fium explain GET /admin
+#   route:      get_admin
+#   params:     (none)
+#   middleware: add-powered-by -> start-session -> auth-session -> role:admin
+```
+
 ## Compared to
 
 | Feature | Fium | RoadRunner | FrankenPHP |
