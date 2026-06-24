@@ -138,20 +138,32 @@ mod tests {
     fn parse_alias_variants() {
         assert_eq!(
             parse_rate_limit_alias("ratelimit:60"),
-            Some(RateLimitConfig { max: 60, window: Duration::from_secs(60) })
+            Some(RateLimitConfig {
+                max: 60,
+                window: Duration::from_secs(60)
+            })
         );
         assert_eq!(
             parse_rate_limit_alias("ratelimit:100,300"),
-            Some(RateLimitConfig { max: 100, window: Duration::from_secs(300) })
+            Some(RateLimitConfig {
+                max: 100,
+                window: Duration::from_secs(300)
+            })
         );
         assert_eq!(
             parse_rate_limit_alias("ratelimit"),
-            Some(RateLimitConfig { max: 60, window: Duration::from_secs(60) })
+            Some(RateLimitConfig {
+                max: 60,
+                window: Duration::from_secs(60)
+            })
         );
         // Zero clamps to 1, matching the PHP middleware.
         assert_eq!(
             parse_rate_limit_alias("ratelimit:0"),
-            Some(RateLimitConfig { max: 1, window: Duration::from_secs(60) })
+            Some(RateLimitConfig {
+                max: 1,
+                window: Duration::from_secs(60)
+            })
         );
         assert!(parse_rate_limit_alias("cors").is_none());
         assert!(parse_rate_limit_alias("auth").is_none());
@@ -160,15 +172,24 @@ mod tests {
     #[test]
     fn allows_up_to_max_then_denies() {
         let limiter = RateLimiter::new();
-        let cfg = RateLimitConfig { max: 2, window: Duration::from_secs(60) };
+        let cfg = RateLimitConfig {
+            max: 2,
+            window: Duration::from_secs(60),
+        };
 
         assert!(matches!(
             limiter.check("r", "1.2.3.4", &cfg),
-            Allow::Allowed { limit: 2, remaining: 1 }
+            Allow::Allowed {
+                limit: 2,
+                remaining: 1
+            }
         ));
         assert!(matches!(
             limiter.check("r", "1.2.3.4", &cfg),
-            Allow::Allowed { limit: 2, remaining: 0 }
+            Allow::Allowed {
+                limit: 2,
+                remaining: 0
+            }
         ));
         assert!(matches!(
             limiter.check("r", "1.2.3.4", &cfg),
@@ -179,27 +200,54 @@ mod tests {
     #[test]
     fn keys_are_per_route_and_per_ip() {
         let limiter = RateLimiter::new();
-        let cfg = RateLimitConfig { max: 1, window: Duration::from_secs(60) };
+        let cfg = RateLimitConfig {
+            max: 1,
+            window: Duration::from_secs(60),
+        };
 
         // Same route, different IPs: each gets its own bucket.
-        assert!(matches!(limiter.check("r", "10.0.0.1", &cfg), Allow::Allowed { .. }));
-        assert!(matches!(limiter.check("r", "10.0.0.2", &cfg), Allow::Allowed { .. }));
+        assert!(matches!(
+            limiter.check("r", "10.0.0.1", &cfg),
+            Allow::Allowed { .. }
+        ));
+        assert!(matches!(
+            limiter.check("r", "10.0.0.2", &cfg),
+            Allow::Allowed { .. }
+        ));
         // Same IP again on the same route is now denied.
-        assert!(matches!(limiter.check("r", "10.0.0.1", &cfg), Allow::Denied { .. }));
+        assert!(matches!(
+            limiter.check("r", "10.0.0.1", &cfg),
+            Allow::Denied { .. }
+        ));
         // Same IP on a different route gets a fresh bucket.
-        assert!(matches!(limiter.check("other", "10.0.0.1", &cfg), Allow::Allowed { .. }));
+        assert!(matches!(
+            limiter.check("other", "10.0.0.1", &cfg),
+            Allow::Allowed { .. }
+        ));
     }
 
     #[test]
     fn window_reset_re_allows() {
         let limiter = RateLimiter::new();
-        let cfg = RateLimitConfig { max: 1, window: Duration::from_millis(20) };
+        let cfg = RateLimitConfig {
+            max: 1,
+            window: Duration::from_millis(20),
+        };
 
-        assert!(matches!(limiter.check("r", "1.2.3.4", &cfg), Allow::Allowed { .. }));
-        assert!(matches!(limiter.check("r", "1.2.3.4", &cfg), Allow::Denied { .. }));
+        assert!(matches!(
+            limiter.check("r", "1.2.3.4", &cfg),
+            Allow::Allowed { .. }
+        ));
+        assert!(matches!(
+            limiter.check("r", "1.2.3.4", &cfg),
+            Allow::Denied { .. }
+        ));
 
         std::thread::sleep(Duration::from_millis(30));
         // Window has elapsed: counter resets and the request is allowed again.
-        assert!(matches!(limiter.check("r", "1.2.3.4", &cfg), Allow::Allowed { .. }));
+        assert!(matches!(
+            limiter.check("r", "1.2.3.4", &cfg),
+            Allow::Allowed { .. }
+        ));
     }
 }

@@ -13,9 +13,7 @@ const FNV_PRIME: u64 = 0x100000001b3;
 /// Returns the path to the `.fium/` directory.
 /// Skips extraction if `.fium/.version` matches the current binary version.
 pub fn extract_php_lib(app_path: &Path) -> anyhow::Result<PathBuf> {
-    let app_dir = app_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let app_dir = app_path.parent().unwrap_or_else(|| Path::new("."));
     let fium_dir = app_dir.join(".fium");
     let version_file = fium_dir.join(".version");
     let embed_version = embedded_php_version();

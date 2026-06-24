@@ -9,10 +9,10 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-use std::{path::PathBuf, sync::Arc};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
+use std::{path::PathBuf, sync::Arc};
 
 use crate::route::{RouteError, RouteTable};
 
@@ -28,7 +28,11 @@ static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 fn profile_enabled() -> bool {
     *PROFILE_ENABLED.get_or_init(|| {
         matches!(
-            std::env::var("FIUM_PROFILE").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+            std::env::var("FIUM_PROFILE")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
             "1" | "true" | "yes" | "on"
         )
     })
@@ -54,12 +58,16 @@ impl Profile {
     }
 
     fn record(&self, encode: Duration, write: Duration, read: Duration, decode: Duration) {
-        self.encode_ns.fetch_add(encode.as_nanos() as u64, Ordering::Relaxed);
-        self.write_ns.fetch_add(write.as_nanos() as u64, Ordering::Relaxed);
-        self.read_ns.fetch_add(read.as_nanos() as u64, Ordering::Relaxed);
-        self.decode_ns.fetch_add(decode.as_nanos() as u64, Ordering::Relaxed);
+        self.encode_ns
+            .fetch_add(encode.as_nanos() as u64, Ordering::Relaxed);
+        self.write_ns
+            .fetch_add(write.as_nanos() as u64, Ordering::Relaxed);
+        self.read_ns
+            .fetch_add(read.as_nanos() as u64, Ordering::Relaxed);
+        self.decode_ns
+            .fetch_add(decode.as_nanos() as u64, Ordering::Relaxed);
         let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 200 == 0 {
+        if n.is_multiple_of(200) {
             let mean = |total: u64| total / n;
             info!(
                 target: "fium_profile",
@@ -81,10 +89,7 @@ pub enum RuntimeWorkerError {
     #[error("worker process disappeared before boot message")]
     BootProcessMissing,
     #[error("worker boot timed out while {context} after {ms} ms")]
-    BootTimeout {
-        context: &'static str,
-        ms: u128,
-    },
+    BootTimeout { context: &'static str, ms: u128 },
     #[error("worker request {request_id} timed out while {stage} after {ms} ms")]
     Timeout {
         request_id: String,
@@ -104,20 +109,11 @@ pub enum RuntimeWorkerError {
         source: serde_json::Error,
     },
     #[error("expected boot message type '{expected}', got '{got}'")]
-    UnexpectedMessageType {
-        expected: &'static str,
-        got: String,
-    },
+    UnexpectedMessageType { expected: &'static str, got: String },
     #[error("worker protocol mismatch: expected {expected}, got {got}")]
-    ProtocolVersionMismatch {
-        expected: u32,
-        got: u32,
-    },
+    ProtocolVersionMismatch { expected: u32, got: u32 },
     #[error("worker request id mismatch: expected {expected}, got {got}")]
-    RequestIdMismatch {
-        expected: String,
-        got: String,
-    },
+    RequestIdMismatch { expected: String, got: String },
     #[error("failed to spawn PHP worker using '{php_binary}' and '{worker_entrypoint}': {source}")]
     Spawn {
         php_binary: String,
@@ -126,10 +122,7 @@ pub enum RuntimeWorkerError {
         source: std::io::Error,
     },
     #[error("worker frame too large: {size} bytes (max {max})")]
-    FrameTooLarge {
-        size: u32,
-        max: u32,
-    },
+    FrameTooLarge { size: u32, max: u32 },
     #[error("worker frame contained invalid UTF-8: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("worker has shut down")]
@@ -139,15 +132,11 @@ pub enum RuntimeWorkerError {
     #[error("worker process unavailable")]
     ProcessUnavailable,
     #[error("worker {pipe} unavailable")]
-    MissingPipe {
-        pipe: &'static str,
-    },
+    MissingPipe { pipe: &'static str },
     #[error(transparent)]
     Routes(#[from] RouteError),
     #[error("all workers failed to boot: {last_error}")]
-    AllWorkersFailedToBoot {
-        last_error: Box<RuntimeWorkerError>,
-    },
+    AllWorkersFailedToBoot { last_error: Box<RuntimeWorkerError> },
     #[error("{request_error}; additionally failed to replace worker after retry failure: {restart_error}")]
     RetryReplacement {
         request_error: Box<RuntimeWorkerError>,
@@ -162,9 +151,10 @@ pub trait WorkerTransport {
 }
 
 // Messages sent from WorkerSupervisor::handle() to the per-worker background task.
+// `request` is boxed to keep the enum's largest variant small (clippy::large_enum_variant).
 enum WorkerMessage {
     Request {
-        request: WorkerRequest,
+        request: Box<WorkerRequest>,
         reply: oneshot::Sender<Result<WorkerResponse, RuntimeWorkerError>>,
     },
     Restart {
@@ -215,8 +205,16 @@ impl WorkerSupervisor {
         boot_timeout_ms: u64,
         max_requests: u64,
     ) -> Self {
-        let timeout_ms = if request_timeout_ms > 0 { request_timeout_ms } else { 750 };
-        let boot_timeout_ms = if boot_timeout_ms > 0 { boot_timeout_ms } else { 10_000 };
+        let timeout_ms = if request_timeout_ms > 0 {
+            request_timeout_ms
+        } else {
+            750
+        };
+        let boot_timeout_ms = if boot_timeout_ms > 0 {
+            boot_timeout_ms
+        } else {
+            10_000
+        };
         let process = Arc::new(Mutex::new(None));
         let (tx, rx) = mpsc::unbounded_channel();
         let pending = Arc::new(AtomicUsize::new(0));
@@ -253,11 +251,19 @@ impl WorkerSupervisor {
                 match msg {
                     WorkerMessage::Request { request, reply } => {
                         let result = Self::process_request(
-                            &php_binary, &worker_entrypoint, &app_file,
-                            request_timeout, boot_timeout, max_requests,
-                            &process, &request,
-                            &requests_handled, &restarts, &errors,
-                        ).await;
+                            &php_binary,
+                            &worker_entrypoint,
+                            &app_file,
+                            request_timeout,
+                            boot_timeout,
+                            max_requests,
+                            &process,
+                            &request,
+                            &requests_handled,
+                            &restarts,
+                            &errors,
+                        )
+                        .await;
                         let _ = reply.send(result);
                     }
                     WorkerMessage::Restart { reply } => {
@@ -321,17 +327,30 @@ impl WorkerSupervisor {
 
         let boot = Self::read_boot_message(worker, self.boot_timeout).await?;
 
-        info!(route_count = boot.routes.len(), "worker booted successfully");
+        info!(
+            route_count = boot.routes.len(),
+            "worker booted successfully"
+        );
 
         Ok(RouteTable::from_boot_routes(boot.routes, boot.cors)?)
     }
 
     /// Queue a request to be processed by this worker. Returns immediately;
     /// the response arrives via the oneshot when the background task finishes.
-    pub async fn handle(&self, request: WorkerRequest) -> Result<WorkerResponse, RuntimeWorkerError> {
+    pub async fn handle(
+        &self,
+        request: WorkerRequest,
+    ) -> Result<WorkerResponse, RuntimeWorkerError> {
         self.pending.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.tx.send(WorkerMessage::Request { request, reply: reply_tx }).is_err() {
+        if self
+            .tx
+            .send(WorkerMessage::Request {
+                request: Box::new(request),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
             self.pending.fetch_sub(1, Ordering::Relaxed);
             return Err(RuntimeWorkerError::WorkerShutdown);
         }
@@ -343,7 +362,12 @@ impl WorkerSupervisor {
     }
 
     /// Process a single request (called from the background task).
+    ///
+    /// Carries the supervisor's config by reference into the static method; the argument
+    /// count is inherent to "no shared config struct yet" — to be refactored when the
+    /// hybrid middleware engine introduces a shared state/context.
     #[tracing::instrument(skip_all, fields(request_id = %request.request_id))]
+    #[allow(clippy::too_many_arguments)]
     async fn process_request(
         php_binary: &str,
         worker_entrypoint: &PathBuf,
@@ -362,21 +386,31 @@ impl WorkerSupervisor {
         // Check if worker needs recycling due to max_requests
         if max_requests > 0 {
             let handled = requests_handled.load(Ordering::Relaxed);
-            if handled > 0 && handled % max_requests == 0 {
+            if handled > 0 && handled.is_multiple_of(max_requests) {
                 info!(handled, max_requests, "recycling worker after max_requests");
                 Self::kill_and_restart(
-                    php_binary, worker_entrypoint, app_file,
-                    boot_timeout, &mut slot,
-                ).await?;
+                    php_binary,
+                    worker_entrypoint,
+                    app_file,
+                    boot_timeout,
+                    &mut slot,
+                )
+                .await?;
                 restarts.fetch_add(1, Ordering::Relaxed);
             }
         }
 
         match Self::dispatch_once(
-            php_binary, worker_entrypoint, app_file,
-            request_timeout, boot_timeout,
-            &mut slot, request,
-        ).await {
+            php_binary,
+            worker_entrypoint,
+            app_file,
+            request_timeout,
+            boot_timeout,
+            &mut slot,
+            request,
+        )
+        .await
+        {
             Ok(response) => {
                 requests_handled.fetch_add(1, Ordering::Relaxed);
                 Ok(response)
@@ -385,16 +419,26 @@ impl WorkerSupervisor {
                 errors.fetch_add(1, Ordering::Relaxed);
                 warn!(%first_error, "worker request failed, attempting restart");
                 Self::kill_and_restart(
-                    php_binary, worker_entrypoint, app_file,
-                    boot_timeout, &mut slot,
-                ).await?;
+                    php_binary,
+                    worker_entrypoint,
+                    app_file,
+                    boot_timeout,
+                    &mut slot,
+                )
+                .await?;
                 restarts.fetch_add(1, Ordering::Relaxed);
 
                 match Self::dispatch_once(
-                    php_binary, worker_entrypoint, app_file,
-                    request_timeout, boot_timeout,
-                    &mut slot, request,
-                ).await {
+                    php_binary,
+                    worker_entrypoint,
+                    app_file,
+                    request_timeout,
+                    boot_timeout,
+                    &mut slot,
+                    request,
+                )
+                .await
+                {
                     Ok(response) => {
                         requests_handled.fetch_add(1, Ordering::Relaxed);
                         Ok(response)
@@ -404,9 +448,14 @@ impl WorkerSupervisor {
                         warn!(%second_error, "worker request failed after restart, replacing worker before returning error");
 
                         match Self::kill_and_restart(
-                            php_binary, worker_entrypoint, app_file,
-                            boot_timeout, &mut slot,
-                        ).await {
+                            php_binary,
+                            worker_entrypoint,
+                            app_file,
+                            boot_timeout,
+                            &mut slot,
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 restarts.fetch_add(1, Ordering::Relaxed);
                                 Err(second_error)
@@ -428,12 +477,13 @@ impl WorkerSupervisor {
         json: &str,
     ) -> Result<(), RuntimeWorkerError> {
         let len = json.len() as u32;
-        writer.write_all(&len.to_be_bytes()).await.map_err(|source| {
-            RuntimeWorkerError::Io {
+        writer
+            .write_all(&len.to_be_bytes())
+            .await
+            .map_err(|source| RuntimeWorkerError::Io {
                 context: "write frame length",
                 source,
-            }
-        })?;
+            })?;
         writer
             .write_all(json.as_bytes())
             .await
@@ -441,10 +491,13 @@ impl WorkerSupervisor {
                 context: "write frame body",
                 source,
             })?;
-        writer.flush().await.map_err(|source| RuntimeWorkerError::Io {
-            context: "flush frame",
-            source,
-        })
+        writer
+            .flush()
+            .await
+            .map_err(|source| RuntimeWorkerError::Io {
+                context: "flush frame",
+                source,
+            })
     }
 
     /// Read a length-prefixed JSON frame from a buffered reader.
@@ -470,12 +523,13 @@ impl WorkerSupervisor {
         }
 
         let mut body = vec![0u8; len as usize];
-        reader.read_exact(&mut body).await.map_err(|source| {
-            RuntimeWorkerError::Io {
+        reader
+            .read_exact(&mut body)
+            .await
+            .map_err(|source| RuntimeWorkerError::Io {
                 context: "read frame body",
                 source,
-            }
-        })?;
+            })?;
 
         String::from_utf8(body).map_err(RuntimeWorkerError::from)
     }
@@ -508,12 +562,11 @@ impl WorkerSupervisor {
             }
         };
 
-        let boot: BootMessage = serde_json::from_str(&frame).map_err(|source| {
-            RuntimeWorkerError::Json {
+        let boot: BootMessage =
+            serde_json::from_str(&frame).map_err(|source| RuntimeWorkerError::Json {
                 context: "parse worker boot message",
                 source,
-            }
-        })?;
+            })?;
 
         if boot.message_type != "boot" {
             return Err(RuntimeWorkerError::UnexpectedMessageType {
@@ -540,8 +593,8 @@ impl WorkerSupervisor {
         let profiling = profile_enabled();
         let t0 = Instant::now();
 
-        let encoded = serde_json::to_string(request)
-            .map_err(|source| RuntimeWorkerError::Json {
+        let encoded =
+            serde_json::to_string(request).map_err(|source| RuntimeWorkerError::Json {
                 context: "encode worker request",
                 source,
             })?;
@@ -565,8 +618,8 @@ impl WorkerSupervisor {
             })??;
         let t3 = Instant::now();
 
-        let response: WorkerResponse = serde_json::from_str(&frame)
-            .map_err(|source| RuntimeWorkerError::Json {
+        let response: WorkerResponse =
+            serde_json::from_str(&frame).map_err(|source| RuntimeWorkerError::Json {
                 context: "decode worker response",
                 source,
             })?;
@@ -647,22 +700,17 @@ impl WorkerSupervisor {
         }
     }
 
-    async fn ensure_started<'a>(
-        slot: &'a mut Option<WorkerProcess>,
-    ) -> Result<&'a mut WorkerProcess, RuntimeWorkerError> {
+    async fn ensure_started(
+        slot: &mut Option<WorkerProcess>,
+    ) -> Result<&mut WorkerProcess, RuntimeWorkerError> {
         // The retry logic in process_request handles worker failures.
         // If the worker died between writes, we'll get an I/O error and restart.
         // No need for a try_wait() syscall on every request.
-        slot.as_mut()
-            .ok_or(RuntimeWorkerError::ProcessUnavailable)
+        slot.as_mut().ok_or(RuntimeWorkerError::ProcessUnavailable)
     }
 
     async fn spawn_worker(&self) -> Result<WorkerProcess, RuntimeWorkerError> {
-        Self::spawn_worker_cfg(
-            &self.php_binary,
-            &self.worker_entrypoint,
-            &self.app_file,
-        ).await
+        Self::spawn_worker_cfg(&self.php_binary, &self.worker_entrypoint, &self.app_file).await
     }
 
     async fn spawn_worker_cfg(
@@ -847,7 +895,10 @@ impl WorkerPool {
     }
 
     /// Dispatch a request to one of two sampled workers, preferring the shorter queue.
-    pub async fn handle(&self, request: WorkerRequest) -> Result<WorkerResponse, RuntimeWorkerError> {
+    pub async fn handle(
+        &self,
+        request: WorkerRequest,
+    ) -> Result<WorkerResponse, RuntimeWorkerError> {
         let index = choose_worker_index(
             self.workers.len(),
             self.dispatch_cursor.as_ref(),
@@ -923,13 +974,10 @@ mod tests {
             reads: VecDeque::from([Ok(response_json("req_1", PROTOCOL_VERSION))]),
         };
 
-        let response = WorkerSupervisor::dispatch_transport(
-            &mut transport,
-            &req,
-            Duration::from_millis(50),
-        )
-        .await
-        .expect("response should succeed");
+        let response =
+            WorkerSupervisor::dispatch_transport(&mut transport, &req, Duration::from_millis(50))
+                .await
+                .expect("response should succeed");
 
         assert_eq!(response.status, 200);
         assert_eq!(transport.writes.len(), 1);
@@ -943,13 +991,10 @@ mod tests {
             reads: VecDeque::from([Ok(response_json("req_other", PROTOCOL_VERSION))]),
         };
 
-        let error = WorkerSupervisor::dispatch_transport(
-            &mut transport,
-            &req,
-            Duration::from_millis(50),
-        )
-        .await
-        .expect_err("request id mismatch should fail");
+        let error =
+            WorkerSupervisor::dispatch_transport(&mut transport, &req, Duration::from_millis(50))
+                .await
+                .expect_err("request id mismatch should fail");
 
         assert!(matches!(
             error,
@@ -971,12 +1016,9 @@ mod tests {
             reads: VecDeque::from([Ok(boot)]),
         };
 
-        let error = WorkerSupervisor::read_boot_message(
-            &mut transport,
-            Duration::from_millis(50),
-        )
-        .await
-        .expect_err("protocol mismatch should fail");
+        let error = WorkerSupervisor::read_boot_message(&mut transport, Duration::from_millis(50))
+            .await
+            .expect_err("protocol mismatch should fail");
 
         assert!(matches!(
             error,
@@ -996,12 +1038,9 @@ mod tests {
             })]),
         };
 
-        let error = WorkerSupervisor::read_boot_message(
-            &mut transport,
-            Duration::from_millis(50),
-        )
-        .await
-        .expect_err("EOF should map to WorkerShutdown");
+        let error = WorkerSupervisor::read_boot_message(&mut transport, Duration::from_millis(50))
+            .await
+            .expect_err("EOF should map to WorkerShutdown");
 
         assert!(matches!(error, RuntimeWorkerError::WorkerShutdown));
     }
@@ -1018,7 +1057,13 @@ mod tests {
         let cursor = AtomicUsize::new(0);
         let pending = [5, 1, 0, 3];
 
-        assert_eq!(choose_worker_index(pending.len(), &cursor, |index| pending[index]), 2);
-        assert_eq!(choose_worker_index(pending.len(), &cursor, |index| pending[index]), 1);
+        assert_eq!(
+            choose_worker_index(pending.len(), &cursor, |index| pending[index]),
+            2
+        );
+        assert_eq!(
+            choose_worker_index(pending.len(), &cursor, |index| pending[index]),
+            1
+        );
     }
 }

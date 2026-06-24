@@ -104,11 +104,15 @@ fn worker_response_matches_php_to_worker_response_shape() {
         "error": null
     }"#;
 
-    let resp: WorkerResponse = serde_json::from_str(json).expect("PHP response shape must deserialize");
+    let resp: WorkerResponse =
+        serde_json::from_str(json).expect("PHP response shape must deserialize");
 
     assert_eq!(resp.status, 200);
     assert_eq!(resp.request_id, "req-7");
-    assert_eq!(resp.headers.get("content-type"), Some(&vec!["application/json".into()]));
+    assert_eq!(
+        resp.headers.get("content-type"),
+        Some(&vec!["application/json".into()])
+    );
     assert_eq!(resp.cookies.len(), 1);
     let cookie = &resp.cookies[0];
     assert_eq!(cookie.name, "fium_session");
@@ -178,11 +182,26 @@ fn worker_request_serializes_to_shape_php_reads() {
 
     // Every key that Request::fromWorkerPayload() reads must be present.
     for key in [
-        "protocol_version", "request_id", "method", "path", "query_string", "headers",
-        "cookies", "route_params", "body", "body_file", "scheme", "host", "client_ip",
-        "is_secure", "matched_route",
+        "protocol_version",
+        "request_id",
+        "method",
+        "path",
+        "query_string",
+        "headers",
+        "cookies",
+        "route_params",
+        "body",
+        "body_file",
+        "scheme",
+        "host",
+        "client_ip",
+        "is_secure",
+        "matched_route",
     ] {
-        assert!(value.get(key).is_some(), "WorkerRequest JSON missing `{key}` (PHP would not see it)");
+        assert!(
+            value.get(key).is_some(),
+            "WorkerRequest JSON missing `{key}` (PHP would not see it)"
+        );
     }
 
     assert_eq!(value["client_ip"], "203.0.113.1");

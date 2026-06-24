@@ -81,12 +81,18 @@ impl RouteTable {
             }
 
             // Parse the first ratelimit directive on the route, if any.
-            if let Some(alias) = br.middleware.iter().find_map(|m| parse_rate_limit_alias(m.as_str())) {
+            if let Some(alias) = br
+                .middleware
+                .iter()
+                .find_map(|m| parse_rate_limit_alias(m.as_str()))
+            {
                 rate_limits.insert(name.clone(), alias);
             }
 
             if is_static_path(&path) {
-                method_routes.static_routes.insert(path.clone(), name.clone());
+                method_routes
+                    .static_routes
+                    .insert(path.clone(), name.clone());
             } else {
                 let segments = parse_segments_owned(&path);
                 method_routes
@@ -323,7 +329,10 @@ mod tests {
 
         assert_eq!(matched.route_name, "team_members_show");
         assert_eq!(matched.params.get("team").map(String::as_str), Some("core"));
-        assert_eq!(matched.params.get("member").map(String::as_str), Some("javier"));
+        assert_eq!(
+            matched.params.get("member").map(String::as_str),
+            Some("javier")
+        );
     }
 
     #[test]
@@ -348,11 +357,15 @@ mod tests {
             ("GET", "/bench/open", "open", &[]),
         ]);
 
-        let limited = t.rate_limit_for("limited").expect("limited route has a directive");
+        let limited = t
+            .rate_limit_for("limited")
+            .expect("limited route has a directive");
         assert_eq!(limited.max, 60);
         assert_eq!(limited.window, std::time::Duration::from_secs(60));
 
-        let flood = t.rate_limit_for("flood").expect("flood route has a directive");
+        let flood = t
+            .rate_limit_for("flood")
+            .expect("flood route has a directive");
         assert_eq!(flood.max, 1);
         assert_eq!(flood.window, std::time::Duration::from_secs(10));
 

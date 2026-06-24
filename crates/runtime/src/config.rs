@@ -169,7 +169,11 @@ fn default_workers() -> usize {
 /// Read a boolean env var: true for 1/true/yes/on (case-insensitive), else false.
 fn native_bool(key: &str) -> bool {
     matches!(
-        std::env::var(key).unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        std::env::var(key)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
         "1" | "true" | "yes" | "on"
     )
 }
@@ -181,7 +185,10 @@ fn parse_size(s: &str) -> Option<usize> {
     } else if let Some(num) = s.strip_suffix("kb") {
         num.trim().parse::<usize>().ok().map(|n| n * 1024)
     } else if let Some(num) = s.strip_suffix("gb") {
-        num.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024 * 1024)
+        num.trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| n * 1024 * 1024 * 1024)
     } else {
         s.parse::<usize>().ok()
     }
@@ -229,16 +236,8 @@ fn parse_compression_level(raw: Option<i32>) -> i32 {
 }
 
 fn resolve_toml_paths(app_dir: &Path, toml: &mut TomlConfig) {
-    toml.tls.cert = toml
-        .tls
-        .cert
-        .take()
-        .map(|path| resolve_path(app_dir, path));
-    toml.tls.key = toml
-        .tls
-        .key
-        .take()
-        .map(|path| resolve_path(app_dir, path));
+    toml.tls.cert = toml.tls.cert.take().map(|path| resolve_path(app_dir, path));
+    toml.tls.key = toml.tls.key.take().map(|path| resolve_path(app_dir, path));
     toml.static_files.dir = toml
         .static_files
         .dir
@@ -346,19 +345,13 @@ impl RuntimeConfig {
                 .tuning
                 .worker_boot_timeout_ms
                 .unwrap_or(defaults.tuning.worker_boot_timeout_ms),
-            reuse_addr: toml
-                .tuning
-                .reuse_addr
-                .unwrap_or(defaults.tuning.reuse_addr),
+            reuse_addr: toml.tuning.reuse_addr.unwrap_or(defaults.tuning.reuse_addr),
         };
         let compression = CompressionConfig {
-            algorithms: toml
-                .compression
-                .algorithms
-                .map_or_else(
-                    || defaults.compression.algorithms.clone(),
-                    |algorithms| parse_compression_algorithms(Some(algorithms)),
-                ),
+            algorithms: toml.compression.algorithms.map_or_else(
+                || defaults.compression.algorithms.clone(),
+                |algorithms| parse_compression_algorithms(Some(algorithms)),
+            ),
             level: parse_compression_level(Some(
                 toml.compression.level.unwrap_or(defaults.compression.level),
             )),
@@ -394,10 +387,7 @@ impl RuntimeConfig {
             log_level: toml.log.level.unwrap_or(defaults.log_level),
             log_format,
             static_dir: toml.static_files.dir.or(defaults.static_dir),
-            static_enabled: toml
-                .static_files
-                .enabled
-                .unwrap_or(defaults.static_enabled),
+            static_enabled: toml.static_files.enabled.unwrap_or(defaults.static_enabled),
             trusted_proxies: defaults.trusted_proxies,
             native_cors_preflight: defaults.native_cors_preflight,
             native_rate_limit: defaults.native_rate_limit,
@@ -594,7 +584,10 @@ mod tests {
         assert_eq!(composed.tuning.max_connections, 50);
         assert_eq!(composed.tuning.worker_boot_timeout_ms, 4_000);
         assert!(!composed.tuning.reuse_addr);
-        assert_eq!(composed.compression.algorithms, vec![CompressionAlgorithm::Gzip]);
+        assert_eq!(
+            composed.compression.algorithms,
+            vec![CompressionAlgorithm::Gzip]
+        );
         assert_eq!(composed.compression.level, 7);
         assert_eq!(composed.compression.static_cache_max_age_secs, 42);
         assert_eq!(composed.tls_cert, Some(PathBuf::from("/tmp/cert.pem")));
@@ -618,8 +611,17 @@ mod tests {
 
         resolve_toml_paths(Path::new("/srv/app"), &mut toml);
 
-        assert_eq!(toml.tls.cert, Some(PathBuf::from("/srv/app/certs/server.crt")));
-        assert_eq!(toml.tls.key, Some(PathBuf::from("/srv/app/certs/server.key")));
-        assert_eq!(toml.static_files.dir, Some(PathBuf::from("/srv/app/public")));
+        assert_eq!(
+            toml.tls.cert,
+            Some(PathBuf::from("/srv/app/certs/server.crt"))
+        );
+        assert_eq!(
+            toml.tls.key,
+            Some(PathBuf::from("/srv/app/certs/server.key"))
+        );
+        assert_eq!(
+            toml.static_files.dir,
+            Some(PathBuf::from("/srv/app/public"))
+        );
     }
 }

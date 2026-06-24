@@ -17,8 +17,8 @@ use clap::Parser;
 use config::{CompressionConfig, LogFormat, RuntimeConfig};
 use fium_transport::{BootCors, CookieMap, HeaderMap, SetCookie, WorkerRequest, PROTOCOL_VERSION};
 use http_body_util::BodyExt;
-use route::RouteTable;
 use ratelimit::{Allow, RateLimiter};
+use route::RouteTable;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     net::SocketAddr,
@@ -30,7 +30,7 @@ use std::{
     time::Instant,
 };
 use tokio::{fs::File, io::AsyncWriteExt, time::Duration};
-use tower_http::compression::{CompressionLayer, CompressionLevel, predicate::SizeAbove};
+use tower_http::compression::{predicate::SizeAbove, CompressionLayer, CompressionLevel};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -42,7 +42,10 @@ const REQUEST_DURATION_BUCKETS: [f64; 13] = [
 const MAX_IN_MEMORY_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Parser)]
-#[command(name = "fium", about = "Deno for PHP — a fast runtime for PHP applications")]
+#[command(
+    name = "fium",
+    about = "Deno for PHP — a fast runtime for PHP applications"
+)]
 enum Cli {
     /// Start the HTTP server
     Serve {
@@ -164,7 +167,9 @@ impl RequestDurationHistogram {
 
         let count = self.count.load(Ordering::Relaxed);
         let sum_seconds = self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-        body.push_str(&format!("fium_request_duration_seconds_sum {sum_seconds}\n"));
+        body.push_str(&format!(
+            "fium_request_duration_seconds_sum {sum_seconds}\n"
+        ));
         body.push_str(&format!("fium_request_duration_seconds_count {count}\n"));
 
         body
@@ -208,22 +213,13 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let (app_path, app_dir) = resolve_app_path(&app)?;
 
-            let cfg = RuntimeConfig::load(
-                &app_dir,
-                host.as_deref(),
-                port,
-                workers,
-                None,
-                None,
-                false,
-            );
+            let cfg =
+                RuntimeConfig::load(&app_dir, host.as_deref(), port, workers, None, None, false);
 
             init_logging(&cfg);
             dev_serve(app_path, app_dir, cfg).await
         }
-        Cli::Init { directory } => {
-            init_project(&directory)
-        }
+        Cli::Init { directory } => init_project(&directory),
     }
 }
 
@@ -238,27 +234,25 @@ fn resolve_app_path(app: &PathBuf) -> anyhow::Result<(PathBuf, PathBuf)> {
         anyhow::bail!("application file not found: {}", app_path.display());
     }
 
-    let app_dir = app_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
+    let app_dir = app_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
     Ok((app_path, app_dir))
 }
 
 fn init_logging(cfg: &RuntimeConfig) {
     use tracing_subscriber::{fmt, EnvFilter};
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&cfg.log_level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.log_level));
 
     match cfg.log_format {
         LogFormat::Json => {
-            fmt()
-                .json()
-                .with_env_filter(filter)
-                .init();
+            fmt().json().with_env_filter(filter).init();
         }
         LogFormat::Pretty => {
-            fmt()
-                .with_env_filter(filter)
-                .init();
+            fmt().with_env_filter(filter).init();
         }
     }
 }
@@ -283,8 +277,7 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
         cfg.tuning.worker_boot_timeout_ms,
     );
 
-    let routes = pool.boot().await
-        .map_err(anyhow::Error::from)?;
+    let routes = pool.boot().await.map_err(anyhow::Error::from)?;
 
     print_boot_banner(&cfg, &routes);
 
@@ -306,14 +299,20 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
     // TLS support
     if config.tls_enabled() {
         let (cert_path, key_path) = if config.tls_self_signed {
-            let tls_dir = app_path.parent().unwrap_or_else(|| std::path::Path::new(".")).join(".fium/tls");
+            let tls_dir = app_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(".fium/tls");
             std::fs::create_dir_all(&tls_dir)?;
             let cert_path = tls_dir.join("cert.pem");
             let key_path = tls_dir.join("key.pem");
 
             if !cert_path.exists() || !key_path.exists() {
                 info!("generating self-signed TLS certificate for development");
-                let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string(), config.host.clone()])?;
+                let cert = rcgen::generate_simple_self_signed(vec![
+                    "localhost".to_string(),
+                    config.host.clone(),
+                ])?;
                 std::fs::write(&cert_path, cert.cert.pem())?;
                 std::fs::write(&key_path, cert.key_pair.serialize_pem())?;
             }
@@ -329,7 +328,8 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
         let scheme = "https";
         info!(%address, %scheme, "starting runtime with TLS");
 
-        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await?;
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await?;
         let handle = axum_server::Handle::new();
         let handle_for_signal = handle.clone();
         let shutdown_config = config.clone();
@@ -340,11 +340,16 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
             )));
         });
 
-        let tcp = bind_tcp_listener(address, config.tuning.max_connections, config.tuning.reuse_addr)?;
+        let tcp = bind_tcp_listener(
+            address,
+            config.tuning.max_connections,
+            config.tuning.reuse_addr,
+        )?;
         let mut server = axum_server::from_tcp_rustls(tcp, rustls_config).handle(handle);
         {
             let http = server.http_builder();
-            http.http1().keep_alive(config.tuning.keep_alive_timeout_secs > 0);
+            http.http1()
+                .keep_alive(config.tuning.keep_alive_timeout_secs > 0);
             if config.tuning.keep_alive_timeout_secs > 0 {
                 let keep_alive = Duration::from_secs(config.tuning.keep_alive_timeout_secs);
                 http.http2().keep_alive_interval(Some(keep_alive));
@@ -368,11 +373,16 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
             )));
         });
 
-        let tcp = bind_tcp_listener(address, config.tuning.max_connections, config.tuning.reuse_addr)?;
+        let tcp = bind_tcp_listener(
+            address,
+            config.tuning.max_connections,
+            config.tuning.reuse_addr,
+        )?;
         let mut server = axum_server::from_tcp(tcp).handle(handle);
         {
             let http = server.http_builder();
-            http.http1().keep_alive(config.tuning.keep_alive_timeout_secs > 0);
+            http.http1()
+                .keep_alive(config.tuning.keep_alive_timeout_secs > 0);
             if config.tuning.keep_alive_timeout_secs > 0 {
                 let keep_alive = Duration::from_secs(config.tuning.keep_alive_timeout_secs);
                 http.http2().keep_alive_interval(Some(keep_alive));
@@ -387,10 +397,7 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn health(
-    State(state): State<AppState>,
-    request: Request<Body>,
-) -> Response {
+async fn health(State(state): State<AppState>, request: Request<Body>) -> Response {
     let accept = request
         .headers()
         .get(axum::http::header::ACCEPT)
@@ -422,7 +429,8 @@ async fn health(
             },
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             json.to_string(),
-        ).into_response()
+        )
+            .into_response()
     } else {
         (StatusCode::OK, "ok").into_response()
     }
@@ -467,9 +475,13 @@ async fn metrics(State(state): State<AppState>) -> Response {
 
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         body,
-    ).into_response()
+    )
+        .into_response()
 }
 
 async fn healthz() -> Response {
@@ -540,7 +552,14 @@ fn print_boot_banner(cfg: &RuntimeConfig, routes: &RouteTable) {
     eprintln!();
     eprintln!("  \x1b[2m→\x1b[0m  URL:     \x1b[1;4m{}\x1b[0m", addr);
     eprintln!("  \x1b[2m→\x1b[0m  Workers: \x1b[1m{}\x1b[0m", cfg.workers);
-    eprintln!("  \x1b[2m→\x1b[0m  TLS:     {}", if cfg.tls_enabled() { "\x1b[32menabled\x1b[0m" } else { "\x1b[2moff\x1b[0m" });
+    eprintln!(
+        "  \x1b[2m→\x1b[0m  TLS:     {}",
+        if cfg.tls_enabled() {
+            "\x1b[32menabled\x1b[0m"
+        } else {
+            "\x1b[2moff\x1b[0m"
+        }
+    );
     if cfg.static_enabled {
         if let Some(ref dir) = cfg.static_dir {
             eprintln!("  \x1b[2m→\x1b[0m  Static:  {}", dir.display());
@@ -549,13 +568,19 @@ fn print_boot_banner(cfg: &RuntimeConfig, routes: &RouteTable) {
     eprintln!();
 
     for (method, path, name) in routes.list() {
-        eprintln!("  \x1b[33m{:<7}\x1b[0m {} \x1b[2m{}\x1b[0m", method, path, name);
+        eprintln!(
+            "  \x1b[33m{:<7}\x1b[0m {} \x1b[2m{}\x1b[0m",
+            method, path, name
+        );
     }
 
     eprintln!();
 }
 
-fn build_router(state: AppState, config: &RuntimeConfig) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
+fn build_router(
+    state: AppState,
+    config: &RuntimeConfig,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/healthz", get(healthz))
@@ -577,10 +602,7 @@ fn build_router(state: AppState, config: &RuntimeConfig) -> axum::extract::conne
                 info!(dir = %static_dir.display(), "serving static files");
                 let serve_dir = build_static_serve_dir(static_dir, &config.compression);
                 app = Router::new()
-                    .nest_service(
-                        "/",
-                        serve_dir.fallback(app.into_service()),
-                    )
+                    .nest_service("/", serve_dir.fallback(app.into_service()))
                     .layer(SetResponseHeaderLayer::overriding(
                         axum::http::header::CACHE_CONTROL,
                         cache_header,
@@ -594,9 +616,9 @@ fn build_router(state: AppState, config: &RuntimeConfig) -> axum::extract::conne
             .quality(CompressionLevel::Precise(config.compression.level))
             .gzip(config.compression.gzip_enabled())
             .br(config.compression.br_enabled())
-            .compress_when(SizeAbove::new(256))
+            .compress_when(SizeAbove::new(256)),
     )
-        .into_make_service_with_connect_info::<SocketAddr>()
+    .into_make_service_with_connect_info::<SocketAddr>()
 }
 
 #[tracing::instrument(skip_all, fields(method, path, request_id))]
@@ -870,7 +892,11 @@ async fn buffer_request_body(
                 if let Some(path) = temp_path {
                     let _ = tokio::fs::remove_file(path).await;
                 }
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to buffer request body",
+                )
+                    .into_response());
             }
             continue;
         }
@@ -886,7 +912,11 @@ async fn buffer_request_body(
                 Ok(file) => file,
                 Err(error) => {
                     error!(%error, %request_id, path = %path.display(), "failed to create request body temp file");
-                    return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to buffer request body",
+                    )
+                        .into_response());
                 }
             };
             temp_path = Some(path);
@@ -900,7 +930,11 @@ async fn buffer_request_body(
                     if let Some(path) = temp_path {
                         let _ = tokio::fs::remove_file(path).await;
                     }
-                    return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to buffer request body",
+                    )
+                        .into_response());
                 }
                 buffered.clear();
             }
@@ -910,7 +944,11 @@ async fn buffer_request_body(
                 if let Some(path) = temp_path {
                     let _ = tokio::fs::remove_file(path).await;
                 }
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to buffer request body",
+                )
+                    .into_response());
             }
         }
     }
@@ -921,10 +959,17 @@ async fn buffer_request_body(
             if let Some(path) = temp_path {
                 let _ = tokio::fs::remove_file(path).await;
             }
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to buffer request body",
+            )
+                .into_response());
         }
 
-        return Ok((None, temp_path.map(|path| path.to_string_lossy().to_string())));
+        return Ok((
+            None,
+            temp_path.map(|path| path.to_string_lossy().to_string()),
+        ));
     }
 
     if buffered.is_empty() {
@@ -940,20 +985,32 @@ async fn buffer_request_body(
                 Ok(file) => file,
                 Err(error) => {
                     error!(%error, %request_id, path = %path.display(), "failed to create request body temp file");
-                    return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to buffer request body",
+                    )
+                        .into_response());
                 }
             };
 
             if let Err(error) = file.write_all(&bytes).await {
                 error!(%error, %request_id, "failed to write streamed request body");
                 let _ = tokio::fs::remove_file(&path).await;
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to buffer request body",
+                )
+                    .into_response());
             }
 
             if let Err(error) = file.flush().await {
                 error!(%error, %request_id, "failed to flush streamed request body");
                 let _ = tokio::fs::remove_file(&path).await;
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to buffer request body").into_response());
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to buffer request body",
+                )
+                    .into_response());
             }
 
             Ok((None, Some(path.to_string_lossy().to_string())))
@@ -989,7 +1046,10 @@ fn init_project(directory: &PathBuf) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir.join("storage/runtime"))?;
 
     eprintln!();
-    eprintln!("  \x1b[1;36mfium\x1b[0m  project created at {}", dir.display());
+    eprintln!(
+        "  \x1b[1;36mfium\x1b[0m  project created at {}",
+        dir.display()
+    );
     eprintln!();
     eprintln!("  Get started:");
     eprintln!("    cd {}", directory.display());
@@ -1021,7 +1081,10 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
     let lib_dir = embed::extract_php_lib(&app_path)?;
     let worker_entrypoint = lib_dir.join("worker.php");
 
-    info!(workers = cfg.workers, "booting PHP worker pool (dev mode)...");
+    info!(
+        workers = cfg.workers,
+        "booting PHP worker pool (dev mode)..."
+    );
     let pool = WorkerPool::new(
         cfg.php_binary.clone(),
         worker_entrypoint.to_string_lossy().to_string(),
@@ -1032,8 +1095,7 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
         cfg.tuning.worker_boot_timeout_ms,
     );
 
-    let routes = pool.boot().await
-        .map_err(anyhow::Error::from)?;
+    let routes = pool.boot().await.map_err(anyhow::Error::from)?;
 
     print_boot_banner(&cfg, &routes);
     eprintln!("  \x1b[2m\u{2192}\x1b[0m  Mode:    \x1b[33mdev\x1b[0m (watching for changes)");
@@ -1058,8 +1120,8 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
     let routes_for_watcher = routes.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-    let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        match res {
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| match res {
             Ok(event) => {
                 let has_php_extension = event
                     .paths
@@ -1071,8 +1133,7 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
                 }
             }
             Err(error) => warn!(%error, "file watcher error"),
-        }
-    })?;
+        })?;
     watcher.watch(app_dir.as_ref(), RecursiveMode::Recursive)?;
 
     tokio::spawn(async move {
@@ -1096,7 +1157,11 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
     });
 
     let address: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
-    let tcp = bind_tcp_listener(address, config.tuning.max_connections, config.tuning.reuse_addr)?;
+    let tcp = bind_tcp_listener(
+        address,
+        config.tuning.max_connections,
+        config.tuning.reuse_addr,
+    )?;
 
     let handle = axum_server::Handle::new();
     let handle_for_signal = handle.clone();
@@ -1111,7 +1176,8 @@ async fn dev_serve(app_path: PathBuf, app_dir: PathBuf, cfg: RuntimeConfig) -> a
     let mut server = axum_server::from_tcp(tcp).handle(handle);
     {
         let http = server.http_builder();
-        http.http1().keep_alive(config.tuning.keep_alive_timeout_secs > 0);
+        http.http1()
+            .keep_alive(config.tuning.keep_alive_timeout_secs > 0);
         if config.tuning.keep_alive_timeout_secs > 0 {
             let keep_alive = Duration::from_secs(config.tuning.keep_alive_timeout_secs);
             http.http2().keep_alive_interval(Some(keep_alive));
@@ -1219,7 +1285,10 @@ fn native_cors_preflight_response(cors: &BootCors) -> Response {
             axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
             cors.headers.as_str(),
         ),
-        (axum::http::header::ACCESS_CONTROL_MAX_AGE, cors.max_age.as_str()),
+        (
+            axum::http::header::ACCESS_CONTROL_MAX_AGE,
+            cors.max_age.as_str(),
+        ),
     ] {
         if let Ok(value) = HeaderValue::from_str(value) {
             response_headers.insert(name, value);
@@ -1233,9 +1302,7 @@ fn native_cors_preflight_response(cors: &BootCors) -> Response {
 /// middleware: JSON body, `Retry-After` header, no X-RateLimit headers (those only
 /// appear on allowed responses).
 fn rate_limit_denied_response(retry_after_secs: u64) -> Response {
-    let mut response = Response::new(Body::from(
-        r#"{"ok":false,"error":"rate_limit_exceeded"}"#,
-    ));
+    let mut response = Response::new(Body::from(r#"{"ok":false,"error":"rate_limit_exceeded"}"#));
     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
     let headers = response.headers_mut();
     headers.insert(
@@ -1291,7 +1358,7 @@ fn encode_cookie_value(value: &str) -> String {
 fn memory_rss_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
-        return linux_memory_rss_bytes().unwrap_or(0);
+        linux_memory_rss_bytes().unwrap_or(0)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1367,7 +1434,10 @@ mod tests {
 
     #[test]
     fn parse_statm_rss_bytes_parses_resident_pages() {
-        assert_eq!(parse_statm_rss_bytes("100 25 0 0 0 0 0", 4096), Some(102_400));
+        assert_eq!(
+            parse_statm_rss_bytes("100 25 0 0 0 0 0", 4096),
+            Some(102_400)
+        );
         assert_eq!(parse_statm_rss_bytes("invalid", 4096), None);
     }
 
@@ -1385,15 +1455,21 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
         let headers = response.headers();
         assert_eq!(
-            headers.get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
+            headers
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
             Some("https://example.com")
         );
         assert_eq!(
-            headers.get("access-control-allow-methods").and_then(|v| v.to_str().ok()),
+            headers
+                .get("access-control-allow-methods")
+                .and_then(|v| v.to_str().ok()),
             Some("GET, POST")
         );
         assert_eq!(
-            headers.get("access-control-max-age").and_then(|v| v.to_str().ok()),
+            headers
+                .get("access-control-max-age")
+                .and_then(|v| v.to_str().ok()),
             Some("600")
         );
     }
@@ -1403,7 +1479,10 @@ mod tests {
         let response = rate_limit_denied_response(42);
         assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            response.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
             Some("42")
         );
         // X-RateLimit headers are only on allowed responses, not on 429.

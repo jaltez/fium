@@ -56,9 +56,11 @@ fn php_available() -> bool {
         .is_ok()
 }
 
+/// The worker's owned stdio pipes plus the guard that kills the worker on drop.
+type WorkerPipes = Option<(WorkerGuard, Box<dyn Write + Send>, Box<dyn Read + Send>)>;
+
 /// Spawn the real PHP worker and return its pipes plus a guard.
-fn spawn_worker(
-) -> Option<(WorkerGuard, Box<dyn Write + Send>, Box<dyn Read + Send>)> {
+fn spawn_worker() -> WorkerPipes {
     if !php_available() {
         return None;
     }
@@ -87,8 +89,12 @@ fn spawn_worker(
 
 fn write_frame<W: Write + ?Sized>(writer: &mut W, payload: &str) {
     let len = payload.len() as u32;
-    writer.write_all(&len.to_be_bytes()).expect("write frame header");
-    writer.write_all(payload.as_bytes()).expect("write frame body");
+    writer
+        .write_all(&len.to_be_bytes())
+        .expect("write frame header");
+    writer
+        .write_all(payload.as_bytes())
+        .expect("write frame body");
     writer.flush().expect("flush frame");
 }
 
@@ -152,7 +158,10 @@ fn real_php_worker_responds_to_request() {
     assert_eq!(response["request_id"], "e2e-1", "request id echoed back");
     assert_eq!(response["status"], 200);
     assert!(
-        response["body"].as_str().unwrap_or("").contains("\"pong\":true"),
+        response["body"]
+            .as_str()
+            .unwrap_or("")
+            .contains("\"pong\":true"),
         "ping body should contain pong, got {}",
         response["body"]
     );
@@ -202,7 +211,10 @@ fn real_php_worker_returns_404_for_unknown_route() {
     let response = read_frame(&mut stdout).expect("worker must respond");
     assert_eq!(response["status"], 404);
     let body = response["body"].as_str().unwrap_or("");
-    assert!(body.contains("route_not_resolved"), "expected route_not_resolved, got {body}");
+    assert!(
+        body.contains("route_not_resolved"),
+        "expected route_not_resolved, got {body}"
+    );
 
     drop(stdin);
     guard.child.as_mut().map(|c| c.kill());
@@ -253,10 +265,7 @@ fn real_php_worker_boot_failure_goes_to_stderr_not_stdout() {
     };
 
     // An app that throws the moment it is required → Application::boot fails.
-    let broken = std::env::temp_dir().join(format!(
-        "fium-broken-boot-{}.php",
-        std::process::id()
-    ));
+    let broken = std::env::temp_dir().join(format!("fium-broken-boot-{}.php", std::process::id()));
     std::fs::write(
         &broken,
         "<?php\nthrow new RuntimeException('deliberate boot failure for e2e');\n",
