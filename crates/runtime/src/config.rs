@@ -370,9 +370,11 @@ impl RuntimeConfig {
                 .map(|w| if w == 0 { default_workers() } else { w })
                 .unwrap_or(defaults.workers),
             max_requests: toml.server.max_requests.unwrap_or(defaults.max_requests),
+            // 0 means "use the default" (mirrors workers=0 = auto), not a 750ms fallback.
             worker_timeout_ms: toml
                 .server
                 .worker_timeout_ms
+                .filter(|&ms| ms > 0)
                 .unwrap_or(defaults.worker_timeout_ms),
             php_binary: std::env::var("FIUM_PHP_BINARY")
                 .ok()
@@ -623,5 +625,20 @@ mod tests {
             toml.static_files.dir,
             Some(PathBuf::from("/srv/app/public"))
         );
+    }
+
+    #[test]
+    fn worker_timeout_zero_means_default_not_750() {
+        // 0 should mean "use the default" (like workers=0 = auto), not the 750ms fallback.
+        let defaults = RuntimeConfig::defaults();
+        let toml = TomlConfig {
+            server: TomlServer {
+                worker_timeout_ms: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let composed = RuntimeConfig::compose(defaults, toml, CliOverrides::default());
+        assert_eq!(composed.worker_timeout_ms, 5_000);
     }
 }
