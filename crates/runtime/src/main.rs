@@ -1174,8 +1174,9 @@ fn init_project(directory: &PathBuf) -> anyhow::Result<()> {
         dir.join(".gitignore"),
         "/storage/\n/.fium/\n/.env\n/vendor/\n",
     )?;
-    // An actual .env so `fium serve` boots out of the box (every app boots the token
-    // service, which needs either FIUM_DEBUG or a real FIUM_API_TOKEN_SECRET).
+    // FIUM_DEBUG=true gives verbose errors during local development. It's not required
+    // to boot (the token service resolves its secret lazily), but it's the sensible dev
+    // default; production sets a real FIUM_API_TOKEN_SECRET instead.
     std::fs::write(dir.join(".env"), "FIUM_DEBUG=true\n")?;
     std::fs::write(
         dir.join(".env.example"),

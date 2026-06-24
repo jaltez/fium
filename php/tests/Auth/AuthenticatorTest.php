@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Fium\Tests\Auth;
 
+use Fium\Auth\ApiTokenService;
 use Fium\Auth\Authenticator;
 use Fium\Auth\NullUserStore;
 use Fium\Auth\User;
@@ -35,6 +36,18 @@ final class AuthenticatorTest extends TestCase
         ]);
 
         $this->auth = Authenticator::fromStore($this->store);
+    }
+
+    public function test_api_token_service_boot_is_lazy_without_a_secret(): void
+    {
+        // Boot must not require a signing secret (or FIUM_DEBUG): the secret is resolved
+        // lazily on first sign(). Ensures apps that never use API tokens boot as-is.
+        putenv('FIUM_DEBUG');
+        putenv('FIUM_API_TOKEN_SECRET');
+
+        $service = ApiTokenService::boot(Authenticator::fromStore(new NullUserStore()));
+
+        self::assertInstanceOf(ApiTokenService::class, $service);
     }
 
     public function test_validate_credentials_success_and_failure(): void

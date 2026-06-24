@@ -10,7 +10,7 @@ final class ApiTokenService implements TokenService
 {
     public function __construct(
         private Authenticator $authenticator,
-        private string $secret,
+        private ?string $secret = null,
         private int $ttlSeconds = 3600,
         private int $refreshTtlSeconds = 2_592_000,
     ) {
@@ -18,7 +18,22 @@ final class ApiTokenService implements TokenService
 
     public static function boot(Authenticator $authenticator): self
     {
-        return new self($authenticator, SigningSecret::resolve('API token'), 3600, 2_592_000);
+        // secret is resolved lazily on first sign() (see secret()), so apps that never use
+        // API tokens don't require a signing secret (or FIUM_DEBUG) at boot.
+        return new self($authenticator, null, 3600, 2_592_000);
+    }
+
+    /**
+     * Resolve the signing secret on first use. An explicit secret passed to the
+     * constructor is used as-is; otherwise it comes from SigningSecret (config/debug).
+     */
+    private function secret(): string
+    {
+        if ($this->secret === null) {
+            $this->secret = SigningSecret::resolve('API token');
+        }
+
+        return $this->secret;
     }
 
     public function issue(User $user): string
@@ -124,7 +139,7 @@ final class ApiTokenService implements TokenService
 
     private function sign(string $payload): string
     {
-        return $this->base64UrlEncode(hash_hmac('sha256', $payload, $this->secret, true));
+        return $this->base64UrlEncode(hash_hmac('sha256', $payload, $this->secret(), true));
     }
 
     private function base64UrlEncode(string $value): string
