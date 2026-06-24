@@ -89,7 +89,7 @@ final class Application
         $userDriver = Config::get('FIUM_USER_DRIVER', 'file');
 
         if ($userDriver === 'pdo') {
-            $dsn = Config::get('FIUM_USER_DSN', 'sqlite:' . $this->baseDir . '/storage/users.db');
+            $dsn = Config::string('FIUM_USER_DSN', 'sqlite:' . $this->baseDir . '/storage/users.db');
             $this->authenticator = Authenticator::fromStore(new Auth\PdoUserStore($dsn));
         } else {
             $this->authenticator = Authenticator::fromFile($usersFile);
@@ -301,8 +301,8 @@ final class Application
     {
         $slug = trim($path, '/');
         $slug = $slug === '' ? 'index' : $slug;
-        $slug = preg_replace('/[{}]/', '', $slug);
-        $slug = preg_replace('/[^a-zA-Z0-9]+/', '_', $slug);
+        $slug = str_replace(['{', '}'], '', $slug);
+        $slug = preg_replace('/[^a-zA-Z0-9]+/', '_', $slug) ?? $slug;
         $slug = trim($slug, '_');
 
         return strtolower($method) . '_' . $slug;
@@ -315,7 +315,13 @@ final class Application
         }
 
         if (is_string($handler) && class_exists($handler)) {
-            return new $handler();
+            $instance = new $handler();
+            // Handler classes implement __invoke, making the instance callable. Validate
+            // the contract so a non-invokable class string fails loudly at boot.
+            if (!$instance instanceof Handler) {
+                throw new \RuntimeException("Handler class '{$handler}' must implement Fium\\Contracts\\Handler.");
+            }
+            return $instance;
         }
 
         throw new \RuntimeException('Cannot resolve route handler.');
@@ -373,8 +379,8 @@ final class Application
     }
 
     /**
-     * @param list<string> $middleware
-     * @param list<string> $stack
+     * @param array<mixed> $middleware
+     * @param array<mixed> $stack
      * @return list<string>
      */
     private function expandMiddlewareList(array $middleware, array $stack = []): array

@@ -111,7 +111,7 @@ final class FileCache implements Cache
         return $this->directory . '/' . $hash . '.cache';
     }
 
-    /** @return ?array{value: mixed, expires_at: ?int} */
+    /** @return ?array{value: mixed, expires_at: int|null} */
     private function read(string $path): ?array
     {
         if (!is_file($path)) {
@@ -131,7 +131,17 @@ final class FileCache implements Cache
             return null;
         }
 
-        return is_array($entry) && array_key_exists('value', $entry) ? $entry : null;
+        if (!is_array($entry) || !array_key_exists('value', $entry)) {
+            return null;
+        }
+
+        // Reconstruct the typed shape so callers (and PHPStan) get the documented fields.
+        $expiresAt = $entry['expires_at'] ?? null;
+
+        return [
+            'value' => $entry['value'],
+            'expires_at' => is_int($expiresAt) ? $expiresAt : null,
+        ];
     }
 
     /** @param array{value: mixed, expires_at: ?int} $entry */

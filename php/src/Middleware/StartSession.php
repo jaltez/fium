@@ -27,7 +27,7 @@ final class StartSession implements Middleware
         $driver = Config::get('FIUM_SESSION_DRIVER', 'file');
 
         if ($driver === 'pdo') {
-            $dsn = Config::get('FIUM_SESSION_DSN', 'sqlite:' . dirname(__DIR__, 2) . '/storage/sessions.db');
+            $dsn = Config::string('FIUM_SESSION_DSN', 'sqlite:' . dirname(__DIR__, 2) . '/storage/sessions.db');
             $this->store = new PdoSessionStore($dsn);
         } else {
             $this->store = new FileSessionStore(dirname(__DIR__, 2) . '/storage/sessions');

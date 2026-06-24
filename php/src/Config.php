@@ -78,6 +78,15 @@ final class Config
     }
 
     /**
+     * Get a configuration value as a non-null string. Use this over get() when a default
+     * is required and the result is assigned to a non-nullable target.
+     */
+    public static function string(string $key, string $default): string
+    {
+        return self::get($key) ?? $default;
+    }
+
+    /**
      * Get a configuration value as an integer.
      */
     public static function int(string $key, int $default = 0): int

@@ -18,10 +18,10 @@ final class Cors implements Middleware
 
     public function __construct()
     {
-        $this->allowedOrigins = Config::get('FIUM_CORS_ORIGINS', '*');
-        $this->allowedMethods = Config::get('FIUM_CORS_METHODS', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-        $this->allowedHeaders = Config::get('FIUM_CORS_HEADERS', 'Content-Type, Authorization, Accept, X-Requested-With');
-        $this->maxAge = Config::get('FIUM_CORS_MAX_AGE', '86400');
+        $this->allowedOrigins = Config::string('FIUM_CORS_ORIGINS', '*');
+        $this->allowedMethods = Config::string('FIUM_CORS_METHODS', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+        $this->allowedHeaders = Config::string('FIUM_CORS_HEADERS', 'Content-Type, Authorization, Accept, X-Requested-With');
+        $this->maxAge = Config::string('FIUM_CORS_MAX_AGE', '86400');
     }
 
     public function handle(Request $request, callable $next): Response

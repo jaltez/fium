@@ -1,5 +1,5 @@
 parameters:
-    level: 6
+    level: 8
     paths:
         - src
     # Static analysis is part of CI and the agent-DX loop: a green `composer check`

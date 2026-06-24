@@ -12,11 +12,11 @@ use Fium\Validator;
 
 final class Request
 {
-    /** @var array<string, mixed>|null */
+    /** @var array<int|string, mixed>|null */
     private ?array $parsedQuery = null;
-    /** @var array<string, mixed>|null */
+    /** @var array<int|string, mixed>|null */
     private ?array $parsedJson = null;
-    /** @var array<string, mixed>|null */
+    /** @var array<int|string, mixed>|null */
     private ?array $parsedForm = null;
     private ?string $loadedBody = null;
     private bool $bodyLoaded = false;
@@ -192,7 +192,7 @@ final class Request
         return is_string($value) ? $value : null;
     }
 
-    /** @return array<string, mixed>|null */
+    /** @return array<int|string, mixed>|null */
     public function json(): ?array
     {
         if ($this->jsonParsed) {
@@ -218,7 +218,7 @@ final class Request
         return $this->parsedJson;
     }
 
-    /** @return array<string, mixed>|null */
+    /** @return array<int|string, mixed>|null */
     public function form(): ?array
     {
         if ($this->formParsed) {
@@ -424,7 +424,7 @@ final class Request
         return $this->payload;
     }
 
-    /** @return array<string, mixed>|null */
+    /** @return array<int|string, mixed>|null */
     private function parseMultipartForm(string $body): ?array
     {
         $contentType = $this->header('content-type');
