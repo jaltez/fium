@@ -44,7 +44,7 @@ const MAX_IN_MEMORY_REQUEST_BODY_BYTES: usize = 64 * 1024;
 #[derive(Parser)]
 #[command(
     name = "fium",
-    about = "Deno for PHP — a fast runtime for PHP applications"
+    about = "A faster PHP miniframework — Laravel-lite, powered by Rust"
 )]
 enum Cli {
     /// Start the HTTP server

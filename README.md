@@ -1,6 +1,6 @@
 # Fium
 
-A fast PHP runtime powered by Rust. Write a single `app.php`, run `fium serve`, done.
+A faster PHP miniframework — Laravel-lite, powered by Rust. Write a single `app.php`, run `fium serve`, done.
 
 ## What it does
 
