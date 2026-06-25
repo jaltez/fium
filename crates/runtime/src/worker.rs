@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use fium_transport::{BootMessage, WorkerRequest, WorkerResponse, PROTOCOL_VERSION};
+use fium_transport::{
+    BootMessage, HeaderMap, SetCookie, WorkerRequest, WorkerResponse, PROTOCOL_VERSION,
+};
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -84,6 +86,33 @@ impl Profile {
 static PROFILE: Profile = Profile::new();
 // -----------------------------------------------------------------------------
 
+/// What a worker dispatch returns to the HTTP layer: a complete buffered response, or a
+/// streaming handle whose chunks arrive over time and must be relayed incrementally.
+pub enum DispatchOutcome {
+    Buffered(WorkerResponse),
+    Streaming(StreamHandle),
+}
+
+/// A streaming response opened by the worker. The HTTP layer drains `chunks` into the
+/// client connection as they arrive; the stream ends when the channel closes.
+pub struct StreamHandle {
+    pub status: u16,
+    pub headers: HeaderMap,
+    pub cookies: Vec<SetCookie>,
+    pub chunks: tokio::sync::mpsc::Receiver<Result<Vec<u8>, RuntimeWorkerError>>,
+}
+
+/// Internal: what dispatch_transport reads from the first frame after a request.
+#[derive(Debug)]
+enum OpenOutcome {
+    Buffered(WorkerResponse),
+    StreamOpen {
+        status: u16,
+        headers: HeaderMap,
+        cookies: Vec<SetCookie>,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeWorkerError {
     #[error("worker process disappeared before boot message")]
@@ -155,7 +184,7 @@ pub trait WorkerTransport {
 enum WorkerMessage {
     Request {
         request: Box<WorkerRequest>,
-        reply: oneshot::Sender<Result<WorkerResponse, RuntimeWorkerError>>,
+        reply: oneshot::Sender<Result<DispatchOutcome, RuntimeWorkerError>>,
     },
     Restart {
         reply: oneshot::Sender<()>,
@@ -250,7 +279,7 @@ impl WorkerSupervisor {
             while let Some(msg) = rx.recv().await {
                 match msg {
                     WorkerMessage::Request { request, reply } => {
-                        let result = Self::process_request(
+                        Self::process_request(
                             &php_binary,
                             &worker_entrypoint,
                             &app_file,
@@ -262,9 +291,11 @@ impl WorkerSupervisor {
                             &requests_handled,
                             &restarts,
                             &errors,
+                            reply,
                         )
                         .await;
-                        let _ = reply.send(result);
+                        // process_request sends the reply internally (early for streaming,
+                        // then relays chunks inline).
                     }
                     WorkerMessage::Restart { reply } => {
                         let mut slot = process.lock().await;
@@ -335,12 +366,12 @@ impl WorkerSupervisor {
         Ok(RouteTable::from_boot_routes(boot.routes, boot.cors)?)
     }
 
-    /// Queue a request to be processed by this worker. Returns immediately;
-    /// the response arrives via the oneshot when the background task finishes.
+    /// Queue a request to be processed by this worker. Returns either a complete buffered
+    /// response or a streaming handle (whose chunks the caller relays to the HTTP client).
     pub async fn handle(
         &self,
         request: WorkerRequest,
-    ) -> Result<WorkerResponse, RuntimeWorkerError> {
+    ) -> Result<DispatchOutcome, RuntimeWorkerError> {
         self.pending.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -361,11 +392,9 @@ impl WorkerSupervisor {
         result
     }
 
-    /// Process a single request (called from the background task).
-    ///
-    /// Carries the supervisor's config by reference into the static method; the argument
-    /// count is inherent to "no shared config struct yet" — to be refactored when the
-    /// hybrid middleware engine introduces a shared state/context.
+    /// Process a single request (called from the background task). Sends the reply
+    /// internally — either a complete response, or a streaming handle whose chunks are
+    /// then relayed inline so the worker stays busy for the stream's lifetime.
     #[tracing::instrument(skip_all, fields(request_id = %request.request_id))]
     #[allow(clippy::too_many_arguments)]
     async fn process_request(
@@ -380,7 +409,8 @@ impl WorkerSupervisor {
         requests_handled: &Arc<AtomicU64>,
         restarts: &Arc<AtomicU64>,
         errors: &Arc<AtomicU64>,
-    ) -> Result<WorkerResponse, RuntimeWorkerError> {
+        reply: oneshot::Sender<Result<DispatchOutcome, RuntimeWorkerError>>,
+    ) {
         let mut slot = process.lock().await;
 
         // Check if worker needs recycling due to max_requests
@@ -388,19 +418,24 @@ impl WorkerSupervisor {
             let handled = requests_handled.load(Ordering::Relaxed);
             if handled > 0 && handled.is_multiple_of(max_requests) {
                 info!(handled, max_requests, "recycling worker after max_requests");
-                Self::kill_and_restart(
+                if let Err(error) = Self::kill_and_restart(
                     php_binary,
                     worker_entrypoint,
                     app_file,
                     boot_timeout,
                     &mut slot,
                 )
-                .await?;
+                .await
+                {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
                 restarts.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        match Self::dispatch_once(
+        // Open phase: send request + read the first frame (with restart+retry on failure).
+        let outcome = match Self::dispatch_once(
             php_binary,
             worker_entrypoint,
             app_file,
@@ -411,21 +446,25 @@ impl WorkerSupervisor {
         )
         .await
         {
-            Ok(response) => {
-                requests_handled.fetch_add(1, Ordering::Relaxed);
-                Ok(response)
-            }
+            Ok(outcome) => outcome,
             Err(first_error) => {
                 errors.fetch_add(1, Ordering::Relaxed);
                 warn!(%first_error, "worker request failed, attempting restart");
-                Self::kill_and_restart(
+                if let Err(restart_error) = Self::kill_and_restart(
                     php_binary,
                     worker_entrypoint,
                     app_file,
                     boot_timeout,
                     &mut slot,
                 )
-                .await?;
+                .await
+                {
+                    let _ = reply.send(Err(RuntimeWorkerError::RetryReplacement {
+                        request_error: Box::new(first_error),
+                        restart_error: Box::new(restart_error),
+                    }));
+                    return;
+                }
                 restarts.fetch_add(1, Ordering::Relaxed);
 
                 match Self::dispatch_once(
@@ -439,15 +478,11 @@ impl WorkerSupervisor {
                 )
                 .await
                 {
-                    Ok(response) => {
-                        requests_handled.fetch_add(1, Ordering::Relaxed);
-                        Ok(response)
-                    }
+                    Ok(outcome) => outcome,
                     Err(second_error) => {
                         errors.fetch_add(1, Ordering::Relaxed);
-                        warn!(%second_error, "worker request failed after restart, replacing worker before returning error");
-
-                        match Self::kill_and_restart(
+                        warn!(%second_error, "worker request failed after restart, replacing worker");
+                        if let Ok(()) = Self::kill_and_restart(
                             php_binary,
                             worker_entrypoint,
                             app_file,
@@ -456,19 +491,90 @@ impl WorkerSupervisor {
                         )
                         .await
                         {
-                            Ok(()) => {
-                                restarts.fetch_add(1, Ordering::Relaxed);
-                                Err(second_error)
-                            }
-                            Err(restart_error) => Err(RuntimeWorkerError::RetryReplacement {
-                                request_error: Box::new(second_error),
-                                restart_error: Box::new(restart_error),
-                            }),
+                            restarts.fetch_add(1, Ordering::Relaxed);
                         }
+                        let _ = reply.send(Err(second_error));
+                        return;
                     }
                 }
             }
+        };
+
+        // Handle the open outcome.
+        requests_handled.fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            OpenOutcome::Buffered(response) => {
+                let _ = reply.send(Ok(DispatchOutcome::Buffered(response)));
+            }
+            OpenOutcome::StreamOpen {
+                status,
+                headers,
+                cookies,
+            } => {
+                let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Vec<u8>, RuntimeWorkerError>>(64);
+                let _ = reply.send(Ok(DispatchOutcome::Streaming(StreamHandle {
+                    status,
+                    headers,
+                    cookies,
+                    chunks: chunk_rx,
+                })));
+
+                // Relay chunks inline — the worker stays busy for the stream's lifetime.
+                if let Err(error) =
+                    Self::relay_stream(&mut slot, chunk_tx, &request.request_id, request_timeout)
+                        .await
+                {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(%error, "stream relay ended with error");
+                }
+            }
         }
+    }
+
+    /// Read `stream_chunk`/`stream_end` frames from the worker and relay decoded bytes to
+    /// the channel. On any error, the sender is dropped, closing the receiver on the
+    /// dispatch side (the HTTP stream simply ends).
+    async fn relay_stream(
+        slot: &mut tokio::sync::MutexGuard<'_, Option<WorkerProcess>>,
+        chunk_tx: mpsc::Sender<Result<Vec<u8>, RuntimeWorkerError>>,
+        request_id: &str,
+        request_timeout: Duration,
+    ) -> Result<(), RuntimeWorkerError> {
+        use base64::Engine as _;
+        let process = slot
+            .as_mut()
+            .ok_or(RuntimeWorkerError::ProcessUnavailable)?;
+
+        loop {
+            let frame = timeout(request_timeout, process.read_frame(MAX_FRAME_SIZE))
+                .await
+                .map_err(|_| RuntimeWorkerError::Timeout {
+                    request_id: request_id.to_string(),
+                    stage: "reading stream chunk",
+                    ms: request_timeout.as_millis(),
+                })??;
+
+            let value: serde_json::Value =
+                serde_json::from_str(&frame).map_err(|source| RuntimeWorkerError::Json {
+                    context: "parse stream frame",
+                    source,
+                })?;
+
+            match value.get("type").and_then(|t| t.as_str()) {
+                Some("stream_chunk") => {
+                    let data_b64 = value.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                    let data = base64::engine::general_purpose::STANDARD
+                        .decode(data_b64)
+                        .unwrap_or_default();
+                    if chunk_tx.send(Ok(data)).await.is_err() {
+                        break; // dispatch dropped the receiver (client disconnected)
+                    }
+                }
+                _ => break, // stream_end or unknown → stream complete
+            }
+        }
+
+        Ok(())
     }
 
     /// Write a length-prefixed JSON frame to a writer.
@@ -589,7 +695,7 @@ impl WorkerSupervisor {
         transport: &mut T,
         request: &WorkerRequest,
         request_timeout: Duration,
-    ) -> Result<WorkerResponse, RuntimeWorkerError> {
+    ) -> Result<OpenOutcome, RuntimeWorkerError> {
         let profiling = profile_enabled();
         let t0 = Instant::now();
 
@@ -618,9 +724,9 @@ impl WorkerSupervisor {
             })??;
         let t3 = Instant::now();
 
-        let response: WorkerResponse =
+        let value: serde_json::Value =
             serde_json::from_str(&frame).map_err(|source| RuntimeWorkerError::Json {
-                context: "decode worker response",
+                context: "decode first frame",
                 source,
             })?;
         let t4 = Instant::now();
@@ -633,6 +739,30 @@ impl WorkerSupervisor {
                 t4.duration_since(t3),
             );
         }
+
+        // Streaming: the worker opened a stream — return the open metadata so the caller
+        // can create the chunk channel and relay subsequent frames.
+        if value.get("type").and_then(|t| t.as_str()) == Some("stream_open") {
+            let status = value.get("status").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
+            let headers: HeaderMap =
+                serde_json::from_value(value.get("headers").cloned().unwrap_or_default())
+                    .unwrap_or_default();
+            let cookies: Vec<SetCookie> =
+                serde_json::from_value(value.get("cookies").cloned().unwrap_or_default())
+                    .unwrap_or_default();
+            return Ok(OpenOutcome::StreamOpen {
+                status,
+                headers,
+                cookies,
+            });
+        }
+
+        // Buffered: decode the full WorkerResponse and validate.
+        let response: WorkerResponse =
+            serde_json::from_value(value).map_err(|source| RuntimeWorkerError::Json {
+                context: "decode worker response",
+                source,
+            })?;
 
         if response.protocol_version != PROTOCOL_VERSION {
             return Err(RuntimeWorkerError::ProtocolVersionMismatch {
@@ -648,7 +778,7 @@ impl WorkerSupervisor {
             });
         }
 
-        Ok(response)
+        Ok(OpenOutcome::Buffered(response))
     }
 
     #[tracing::instrument(skip_all, fields(request_id = %request.request_id))]
@@ -660,7 +790,7 @@ impl WorkerSupervisor {
         _boot_timeout: Duration,
         slot: &mut Option<WorkerProcess>,
         request: &WorkerRequest,
-    ) -> Result<WorkerResponse, RuntimeWorkerError> {
+    ) -> Result<OpenOutcome, RuntimeWorkerError> {
         let process = Self::ensure_started(slot).await?;
         Self::dispatch_transport(process, request, request_timeout).await
     }
@@ -898,7 +1028,7 @@ impl WorkerPool {
     pub async fn handle(
         &self,
         request: WorkerRequest,
-    ) -> Result<WorkerResponse, RuntimeWorkerError> {
+    ) -> Result<DispatchOutcome, RuntimeWorkerError> {
         let index = choose_worker_index(
             self.workers.len(),
             self.dispatch_cursor.as_ref(),
@@ -974,10 +1104,15 @@ mod tests {
             reads: VecDeque::from([Ok(response_json("req_1", PROTOCOL_VERSION))]),
         };
 
-        let response =
+        let outcome =
             WorkerSupervisor::dispatch_transport(&mut transport, &req, Duration::from_millis(50))
                 .await
                 .expect("response should succeed");
+
+        let response = match outcome {
+            OpenOutcome::Buffered(r) => r,
+            OpenOutcome::StreamOpen { .. } => panic!("expected buffered, got stream_open"),
+        };
 
         assert_eq!(response.status, 200);
         assert_eq!(transport.writes.len(), 1);

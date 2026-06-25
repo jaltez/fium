@@ -34,7 +34,7 @@ use tower_http::compression::{predicate::SizeAbove, CompressionLayer, Compressio
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use worker::{RuntimeWorkerError, WorkerPool};
+use worker::{DispatchOutcome, RuntimeWorkerError, WorkerPool};
 
 const REQUEST_DURATION_BUCKETS: [f64; 13] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
@@ -906,7 +906,7 @@ async fn dispatch(
     }
 
     match result {
-        Ok(worker_response) => {
+        Ok(DispatchOutcome::Buffered(worker_response)) => {
             let elapsed = start.elapsed();
             state.request_latency.record(elapsed);
             info!(
@@ -977,6 +977,40 @@ async fn dispatch(
                 inject_security_headers(&mut response);
             }
 
+            response
+        }
+        Ok(DispatchOutcome::Streaming(handle)) => {
+            let elapsed = start.elapsed();
+            state.request_latency.record(elapsed);
+            info!(
+                method = %log_method,
+                path = %log_path,
+                status = handle.status,
+                %request_id,
+                "streaming response started"
+            );
+
+            let body =
+                Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(handle.chunks));
+            let mut response = Response::new(body);
+            *response.status_mut() = StatusCode::from_u16(handle.status).unwrap_or(StatusCode::OK);
+            for (name, values) in &handle.headers {
+                for value in values {
+                    if let (Ok(header_name), Ok(header_value)) = (
+                        axum::http::header::HeaderName::try_from(name.as_str()),
+                        HeaderValue::from_str(value),
+                    ) {
+                        response.headers_mut().append(header_name, header_value);
+                    }
+                }
+            }
+            for cookie in &handle.cookies {
+                if let Ok(value) = HeaderValue::from_str(&format_set_cookie(cookie)) {
+                    response
+                        .headers_mut()
+                        .append(axum::http::header::SET_COOKIE, value);
+                }
+            }
             response
         }
         Err(error) => {

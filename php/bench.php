@@ -7,6 +7,7 @@ declare(strict_types=1);
 
 use Fium\Runtime\Request;
 use Fium\Runtime\Response;
+use Fium\Runtime\Stream;
 
 return [
     // Workload "json": trivial PHP handler. Always crosses into PHP in both modes,
@@ -42,6 +43,19 @@ return [
         'middleware' => ['security-headers'],
         'handler' => fn(Request $r) => Response::json(['secure' => true]),
     ],
+
+    // Streaming/SSE probe: emits events incrementally. Rust relays the chunks to the
+    // client as they arrive (no buffering). Used by the integration test.
+    'GET /bench/sse' => function (Request $r): Response {
+        return Response::stream(static function (Stream $s): void {
+            foreach (range(1, 3) as $i) {
+                $s->event("tick-{$i}", 'message');
+            }
+        }, 200, [
+            'content-type' => ['text/event-stream'],
+            'cache-control' => ['no-cache'],
+        ]);
+    },
 
     // Workload "preflight" — the PHP path (Before). Only reached when FIUM_NATIVE_CORS=0.
     // Produces the same 204 + CORS headers as the Rust path so the comparison isolates

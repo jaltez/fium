@@ -272,3 +272,39 @@ fn native_security_headers_are_stamped_by_rust() {
     assert!(header("referrer-policy").is_some());
     assert!(header("permissions-policy").is_some());
 }
+
+#[test]
+fn streaming_sse_relays_events_to_the_client() {
+    let Some((_guard, port)) = spawn(false, false, false) else {
+        eprintln!("skipping: fium binary or php not available");
+        return;
+    };
+
+    let response = http(port, "GET", "/bench/sse", &[]).expect("sse response");
+    assert_eq!(response.status, 200);
+    // The 3 SSE events must be present in the relayed body (chunked transfer).
+    assert!(
+        response.body.contains("data: tick-1"),
+        "missing tick-1: {}",
+        response.body
+    );
+    assert!(
+        response.body.contains("data: tick-2"),
+        "missing tick-2: {}",
+        response.body
+    );
+    assert!(
+        response.body.contains("data: tick-3"),
+        "missing tick-3: {}",
+        response.body
+    );
+    // Content-Type must be the SSE type the handler declared.
+    assert!(
+        response
+            .headers
+            .iter()
+            .any(|(key, value)| key == "content-type" && value.contains("text/event-stream")),
+        "missing text/event-stream content-type: {:?}",
+        response.headers
+    );
+}
