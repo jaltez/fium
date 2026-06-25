@@ -24,7 +24,12 @@ final class FileSessionStore extends AbstractSessionStore
             return new Session($sessionId, [], false, true);
         }
 
-        $payload = json_decode((string) file_get_contents($path), true);
+        $contents = file_get_contents($path);
+        if ($contents === false) {
+            return new Session($sessionId, [], false, true);
+        }
+
+        $payload = json_decode($contents, true);
 
         if (!is_array($payload)) {
             return new Session($sessionId, [], false, true);

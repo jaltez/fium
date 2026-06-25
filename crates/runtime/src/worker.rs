@@ -186,9 +186,6 @@ enum WorkerMessage {
         request: Box<WorkerRequest>,
         reply: oneshot::Sender<Result<DispatchOutcome, RuntimeWorkerError>>,
     },
-    Restart {
-        reply: oneshot::Sender<()>,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -296,11 +293,6 @@ impl WorkerSupervisor {
                         .await;
                         // process_request sends the reply internally (early for streaming,
                         // then relays chunks inline).
-                    }
-                    WorkerMessage::Restart { reply } => {
-                        let mut slot = process.lock().await;
-                        Self::kill_process(&mut slot).await;
-                        let _ = reply.send(());
                     }
                 }
             }
@@ -963,8 +955,10 @@ impl WorkerPool {
     }
 
     /// Restart all workers and rebuild the route table from a fresh boot message.
+    /// Restart all workers and rebuild the route table. boot() replaces every worker
+    /// (spawns new, drops old via kill_on_drop) and reads the fresh manifest — no need
+    /// for a separate restart_all pass that would add a redundant lock wait.
     pub async fn reload(&self) -> Result<RouteTable, RuntimeWorkerError> {
-        self.restart_all().await;
         self.boot().await
     }
 
@@ -1007,22 +1001,6 @@ impl WorkerPool {
         Err(RuntimeWorkerError::AllWorkersFailedToBoot {
             last_error: Box::new(last_err.unwrap_or(RuntimeWorkerError::BootProcessMissing)),
         })
-    }
-
-    /// Restart all workers (used by dev mode file watcher).
-    pub async fn restart_all(&self) {
-        let mut handles = Vec::new();
-        for worker in self.workers.iter() {
-            let tx = worker.tx.clone();
-            handles.push(tokio::spawn(async move {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = tx.send(WorkerMessage::Restart { reply: reply_tx });
-                let _ = reply_rx.await;
-            }));
-        }
-        for handle in handles {
-            let _ = handle.await;
-        }
     }
 
     /// Dispatch a request to one of two sampled workers, preferring the shorter queue.

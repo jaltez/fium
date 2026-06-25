@@ -22,7 +22,9 @@ pub struct RateLimitConfig {
 /// `ratelimit`. Returns `None` for anything that isn't a rate-limit directive.
 pub fn parse_rate_limit_alias(alias: &str) -> Option<RateLimitConfig> {
     let rest = match alias {
-        a if a.starts_with("ratelimit:") => a.strip_prefix("ratelimit:").unwrap(),
+        a if a.starts_with("ratelimit:") => a
+            .strip_prefix("ratelimit:")
+            .expect("guarded by starts_with above"),
         "ratelimit" => "",
         _ => return None,
     };
@@ -104,6 +106,8 @@ impl RateLimiter {
         }
     }
 
+    /// Pick a shard by hashing the key. DefaultHasher (SipHash) is ~10ns/call — negligible
+    /// vs the IPC cost. Swap for FxHash if this ever shows in a profile.
     fn shard_index(&self, route: &str, ip: &str) -> usize {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         route.hash(&mut hasher);

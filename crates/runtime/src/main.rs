@@ -454,10 +454,15 @@ async fn serve(app_path: PathBuf, cfg: RuntimeConfig) -> anyhow::Result<()> {
 
             (cert_path, key_path)
         } else {
-            (
-                config.tls_cert.clone().expect("TLS cert path required"),
-                config.tls_key.clone().expect("TLS key path required"),
-            )
+            let cert = config
+                .tls_cert
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("TLS cert path required (--tls-cert or [tls] cert in fium.toml) when TLS is enabled"))?;
+            let key = config
+                .tls_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("TLS key path required (--tls-key or [tls] key in fium.toml) when TLS is enabled"))?;
+            (cert, key)
         };
 
         let scheme = "https";
@@ -712,6 +717,9 @@ fn print_boot_banner(cfg: &RuntimeConfig, routes: &RouteTable) {
     eprintln!();
 }
 
+// TODO(prod-hardening): add a tower CatchUnwind layer so handler panics become 500s
+// instead of aborting the connection task. The primary panic vectors (rate-limiter mutex
+// poison, TLS cert/key) are already addressed; this is defense-in-depth for unknown panics.
 fn build_router(
     state: AppState,
     config: &RuntimeConfig,
@@ -754,6 +762,27 @@ fn build_router(
             .compress_when(SizeAbove::new(256)),
     )
     .into_make_service_with_connect_info::<SocketAddr>()
+}
+
+/// RAII guard for a spill file: removes it on drop (sync, for panic safety). The normal
+/// cleanup path calls `take_path()` first (async remove), so on success the guard is empty.
+struct SpillGuard(Option<String>);
+
+impl SpillGuard {
+    fn new(path: Option<String>) -> Self {
+        Self(path)
+    }
+    fn take_path(&mut self) -> Option<String> {
+        self.0.take()
+    }
+}
+
+impl Drop for SpillGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 #[tracing::instrument(skip_all, fields(method, path, request_id))]
@@ -876,6 +905,10 @@ async fn dispatch(
         }
     };
 
+    // RAII: if dispatch panics after buffering a large body to disk, the spill file is
+    // still cleaned up when _spill_guard drops (sync remove). Normal path takes from the guard.
+    let mut _spill_guard = SpillGuard::new(body_file.clone());
+
     let worker_request = WorkerRequest {
         protocol_version: PROTOCOL_VERSION,
         request_id: request_id.clone(),
@@ -899,7 +932,7 @@ async fn dispatch(
 
     let result = state.pool.handle(worker_request).await;
 
-    if let Some(body_file) = body_file {
+    if let Some(body_file) = _spill_guard.take_path() {
         if let Err(error) = tokio::fs::remove_file(&body_file).await {
             warn!(%error, request_id, body_file, "failed to remove streamed request body file");
         }
@@ -980,8 +1013,9 @@ async fn dispatch(
             response
         }
         Ok(DispatchOutcome::Streaming(handle)) => {
-            let elapsed = start.elapsed();
-            state.request_latency.record(elapsed);
+            // Don't record latency here — the stream continues after dispatch returns,
+            // so start.elapsed() would be "time to stream open," not total stream time.
+            // Recording it would skew the histogram; buffered requests are recorded above.
             info!(
                 method = %log_method,
                 path = %log_path,
