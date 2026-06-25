@@ -182,10 +182,21 @@ while (true) {
 
     // Streaming responses can't be encoded into one frame — drive stream_open/chunk/end.
     if ($response instanceof Response && $response->isStreaming()) {
-        $response->emitTo(
-            static fn (string $json) => write_frame_raw($stdout, $json),
-            isset($request['request_id']) ? (string) $request['request_id'] : null,
-        );
+        $streamRequestId = isset($request['request_id']) ? (string) $request['request_id'] : null;
+        $writeFrame = static fn (string $json) => write_frame_raw($stdout, $json);
+
+        try {
+            $response->emitTo($writeFrame, $streamRequestId);
+        } catch (\Throwable $e) {
+            // The streaming callable threw. Send stream_end so Rust closes the stream
+            // cleanly instead of waiting for more chunks; log and continue — don't crash.
+            fwrite(STDERR, sprintf("STREAM ERROR: %s: %s\n", get_class($e), $e->getMessage()));
+            $writeFrame(json_encode([
+                'type' => 'stream_end',
+                'request_id' => $streamRequestId,
+            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        }
+
         fflush($stdout);
 
         if ($PROFILE) {

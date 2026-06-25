@@ -117,9 +117,8 @@ impl RateLimiter {
         let now = Instant::now();
         let key = (route_name.to_string(), ip.to_string());
         let index = self.shard_index(route_name, ip);
-        let mut shard = self.shards[index]
-            .lock()
-            .expect("rate limiter mutex poisoned");
+        // Recover from poisoning (a prior panic on this shard) instead of cascading.
+        let mut shard = self.shards[index].lock().unwrap_or_else(|e| e.into_inner());
 
         // Bound memory: if this shard is large, drop buckets whose own window has elapsed
         // — but only once per PURGE_INTERVAL, never every request.

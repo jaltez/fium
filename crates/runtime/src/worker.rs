@@ -856,6 +856,7 @@ impl WorkerSupervisor {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|source| RuntimeWorkerError::Spawn {
                 php_binary: php_binary.to_string(),

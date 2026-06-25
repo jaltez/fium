@@ -24,7 +24,14 @@ final class SigningSecret
                     );
                 }
 
-                $secret = trim((string) file_get_contents($secretFile));
+                $contents = file_get_contents($secretFile);
+                if ($contents === false) {
+                    throw new \RuntimeException(
+                        "Failed to read FIUM_API_TOKEN_SECRET_FILE: {$secretFile}"
+                    );
+                }
+
+                $secret = trim($contents);
 
                 if ($secret === '') {
                     throw new \RuntimeException('FIUM_API_TOKEN_SECRET_FILE must contain a non-empty secret.');
