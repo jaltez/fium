@@ -1,7 +1,7 @@
 # Fium
 
 > [!WARNING]
-> ### Experimental — personal research project, archived (sunset)
+> ### Experimental: personal research project, archived (sunset)
 > This repository is a **finished personal research experiment**, published as-is for
 > educational reference. It is **not maintained**: no support, no releases, no issue
 > triage, no security patches. It never reached a stable release and was never used
@@ -9,13 +9,13 @@
 >
 > Do **not** use it for anything real. If you need a maintained PHP application
 > server, use [FrankenPHP](https://frankenphp.dev), [RoadRunner](https://roadrunner.dev),
-> [Swoole](https://www.swoole.co.uk), or plain PHP-FPM — see
+> [Swoole](https://www.swoole.co.uk), or plain PHP-FPM; see
 > [Alternatives](#alternatives-if-you-need-something-maintained) below.
 >
 > Everything below describes what the project **was** at the moment of archival
 > (June 2026), in past-tense spirit where it matters.
 
-A faster PHP miniframework — Laravel-lite, powered by Rust. Write a single `app.php`,
+A faster PHP miniframework: Laravel-lite, powered by Rust. Write a single `app.php`,
 run `fium serve`, done. Single binary; the framework ships inside it.
 
 ## What this repository is (and isn't)
@@ -27,13 +27,13 @@ Fium was a solo research project exploring one question:
 The measured answer shaped the whole design: a JSON-over-stdio round-trip into a PHP
 worker costs ~0.39 ms regardless of how little the handler does. Whole request classes
 answered in Rust (CORS preflight, rate-limit rejections, static files, health ticks)
-run ~8–9× faster — and, more importantly, stateful rate limiting enforced in the Rust
+run ~8-9x faster. More importantly, stateful rate limiting enforced in the Rust
 process is *coherent across the worker pool* (60 means 60, not 60×N workers) and
 actually protects the PHP pool under flood (1 PHP hit per 8000 flooded requests,
 versus 8000 when PHP enforces it).
 
-The full investigation — including two ideas that were **dropped after profiling
-showed they weren't worth it** (binary wire framing; moving sessions into Rust) — is
+The full investigation, including two ideas that were **dropped after profiling
+showed they weren't worth it** (binary wire framing; moving sessions into Rust), is
 documented with numbers in [BENCHMARKS.md](BENCHMARKS.md).
 
 **What it isn't:** a product. The engine that would have generalized the early wins
@@ -52,9 +52,9 @@ Rust tests + PHPUnit suite with PHPStan level 8, full CI.
 - The **hybrid middleware engine** is point solutions, not a general mechanism:
   PHP still runs its (no-op'ing) middleware hops; no `NativeMiddleware` trait, no
   unified `FIUM_NATIVE` toggle, no auth short-circuits.
-- **Rate-limit state is in-memory only** — not shared across instances behind a load
+- **Rate-limit state is in-memory only**: not shared across instances behind a load
   balancer, not durable across restarts.
-- Benchmarks are **intra-Fium only** with `ab` on loopback, without opcache — no
+- Benchmarks are **intra-Fium only** with `ab` on loopback, without opcache; no
   claims versus FrankenPHP/RoadRunner were ever validated.
 - No releases, no versioning discipline beyond the protocol version, single-author
   bus factor of 1.
@@ -63,7 +63,7 @@ Rust tests + PHPUnit suite with PHPStan level 8, full CI.
 
 - **Rust binary** (axum/tokio) owns HTTP serving, route matching, TLS, static files,
   gzip/Brotli compression, worker supervision, and Prometheus metrics
-- **PHP** owns business logic — handlers, middleware, sessions, auth, caching
+- **PHP** owns business logic: handlers, middleware, sessions, auth, caching
 - **Zero-Composer-dependency** PHP framework embedded in the binary
 - **Zero-config** by default; optional `fium.toml` for power users
 
@@ -110,9 +110,9 @@ Or with the bundled example app:
 |---|---|---|
 | `fium serve [app.php]` | Start the HTTP server | `--host`, `-p/--port`, `-w/--workers`, `--tls-cert`, `--tls-key`, `--tls-self-signed` |
 | `fium dev [app.php]` | Serve with file watching + worker restart | `--host`, `-p/--port`, `-w/--workers` |
-| `fium init [dir]` | Scaffold a new project | — |
-| `fium routes [app.php]` | List every route with its resolved middleware chain | — |
-| `fium explain <METHOD> <path> [app.php]` | Resolve a request: matched route, params, middleware chain | — |
+| `fium init [dir]` | Scaffold a new project | none |
+| `fium routes [app.php]` | List every route with its resolved middleware chain | none |
+| `fium explain <METHOD> <path> [app.php]` | Resolve a request: matched route, params, middleware chain | none |
 
 `routes`/`explain` boot the app, so they need the same env as `serve`.
 
@@ -167,7 +167,7 @@ Three of these have native Rust fast paths behind the `FIUM_NATIVE_*` toggles:
 CORS preflight (short-circuit, 204 in ~0.05 ms), rate-limit (short-circuit, pool-wide
 coherent counters, 429 in ~0.036 ms), security headers (response mutation).
 
-## Benchmarks (intra-Fium, loopback, `ab` — treat as relative only)
+## Benchmarks (intra-Fium, loopback, `ab`; treat as relative only)
 
 | Probe | PHP path | Rust path | Delta |
 |---|---:|---:|---|
@@ -187,8 +187,8 @@ Methodology, profiling of the IPC tax, and the two ideas dropped after measureme
 | Framework | Own, embedded, zero-Composer | Yours (Composer/PSR-7) | Yours (Composer) | Yours (Composer) |
 | Status | Archived experiment | Production | Production | Production |
 
-Fium's niche — a whole vertical stack (runtime *plus* Laravel-lite framework) in one
-binary — is not what these provide; they are servers for existing Composer apps.
+Fium's niche, a whole vertical stack (runtime *plus* Laravel-lite framework) in one
+binary, is not what these provide; they are servers for existing Composer apps.
 
 ## Documentation
 
@@ -201,7 +201,7 @@ binary — is not what these provide; they are servers for existing Composer app
 - [PHP API Reference](docs/api-reference.md)
 - [Benchmarks & research log](BENCHMARKS.md)
 
-Contributions are **closed** — [CONTRIBUTING.md](CONTRIBUTING.md) is kept as a
+Contributions are **closed**: [CONTRIBUTING.md](CONTRIBUTING.md) is kept as a
 record of the engineering practices used, not as an invitation.
 
 ## License

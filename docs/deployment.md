@@ -133,11 +133,11 @@ curl http://localhost:3000/_fium/metrics
 ```
 
 Exposed metrics:
-- `fium_requests_total` — total requests handled
-- `fium_worker_restarts_total` — worker restart count
-- `fium_worker_errors_total` — worker error count
-- `fium_workers_total` — number of worker processes
-- `fium_uptime_seconds` — server uptime
+- `fium_requests_total`: total requests handled
+- `fium_worker_restarts_total`: worker restart count
+- `fium_worker_errors_total`: worker error count
+- `fium_workers_total`: number of worker processes
+- `fium_uptime_seconds`: server uptime
 
 ### Production logging
 

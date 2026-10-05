@@ -53,15 +53,15 @@ crash, so a bug in one handler can never take the server down.
 
 The wire format is a sequence of **length-prefixed JSON frames**: a 4-byte
 big-endian `u32` length header followed by that many bytes of UTF-8 JSON. This
-is deliberately text-based JSON — debuggability was chosen over raw throughput
+is deliberately text-based JSON; debuggability was chosen over raw throughput
 during the feasibility phase. The framing itself is binary, so partial reads
 and large payloads are handled cleanly. See [Protocol V1 Specification](protocol-v1.md).
 
 Two message kinds cross the boundary:
 
-- **Boot** — the worker's first stdout frame: `{ protocol_version, type: "boot",
+- **Boot**: the worker's first stdout frame: `{ protocol_version, type: "boot",
   routes: [...] }`. The runtime builds its `RouteTable` from it.
-- **Request / Response** — the runtime sends a `WorkerRequest`; the worker
+- **Request / Response**: the runtime sends a `WorkerRequest`; the worker
   replies with a `WorkerResponse` carrying status, headers, cookies, body, and
   an optional error envelope.
 
@@ -79,7 +79,7 @@ Consequence: **the embedded framework must be self-contained.** `worker.php`
 registers a single autoloader (`Fium\` → `src/`) and never loads
 `vendor/autoload.php`. Composer dependencies are not embedded, so an external
 package would be invisible to a deployed worker. Every feature added to
-`php/src/` is therefore a pure-PHP, dependency-free implementation — including
+`php/src/` is therefore a pure-PHP, dependency-free implementation, including
 the query builder, the active-record `Model`, and the cache drivers. The
 optional Redis cache driver uses the `redis` PHP *extension* (loaded into the
 interpreter) rather than a Composer package.
@@ -106,7 +106,7 @@ interpreter) rather than a Composer package.
 
 Middleware are referenced by alias (e.g. `csrf`, `auth`, `ratelimit:60`).
 Aliases resolve to class names, are instantiated once and cached for the
-worker's lifetime, and compiled into a single closure chain at boot — so per-
+worker's lifetime, and compiled into a single closure chain at boot, so per-
 request dispatch is a straight run down the chain with no alias resolution.
 Middleware groups (`middleware_groups` in the routes file) expand recursively
 with cycle detection.
@@ -116,12 +116,12 @@ with cycle detection.
 The framework ships a small, safe data layer that respects the
 zero-Composer-dependency rule:
 
-- `Fium\Database\Connection` — a lazily-configured PDO singleton, driven by
+- `Fium\Database\Connection`: a lazily-configured PDO singleton, driven by
   `FIUM_DB_*` environment variables or explicit injection.
-- `Fium\Database\QueryBuilder` — a fluent builder. **Values are always bound
+- `Fium\Database\QueryBuilder`: a fluent builder. **Values are always bound
   as parameters**; identifiers are validated against a strict charset and used
   verbatim (SQL has no parameterization for identifiers).
-- `Fium\Database\Model` — an active-record base with `find`, `all`, `create`,
+- `Fium\Database\Model`: an active-record base with `find`, `all`, `create`,
   `save`, `delete`, and a fillable mass-assignment allow-list.
 - `Fium\Cache\CacheManager` resolves a cache driver from `FIUM_CACHE_DRIVER`:
   `array` (default), `file`, or `redis` (optional, via phpredis).

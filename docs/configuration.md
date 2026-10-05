@@ -49,7 +49,7 @@ dir = "public"             # Directory relative to app.php
 | `-w, --workers` | `server.workers` | `fium serve -w 8` |
 | `--tls-cert` | `tls.cert` | `fium serve --tls-cert cert.pem` |
 | `--tls-key` | `tls.key` | `fium serve --tls-key key.pem` |
-| `--tls-self-signed` | — | `fium serve --tls-self-signed` |
+| `--tls-self-signed` | none | `fium serve --tls-self-signed` |
 
 ## Environment variables
 
@@ -85,7 +85,7 @@ Set `max_requests` to prevent PHP memory leaks from accumulating:
 max_requests = 500    # Restart worker after 500 requests
 ```
 
-Workers are restarted gracefully — the current request completes before recycling.
+Workers are restarted gracefully; the current request completes before recycling.
 
 ## TLS
 

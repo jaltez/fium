@@ -2,7 +2,7 @@
 
 > [!WARNING]
 > **This repository is archived (sunset).** Contributions, issues, and pull requests
-> are **closed** — the project is no longer maintained. This guide is kept only as a
+> are **closed**: the project is no longer maintained. This guide is kept only as a
 > record of the engineering practices and architectural constraints the project
 > followed, in case the code is useful to anyone studying it.
 
@@ -58,7 +58,7 @@ cargo test -p fium-runtime       # runtime unit tests + the live PHP e2e tests
 The end-to-end tests in `crates/runtime/tests/php_worker_e2e.rs` spawn a real
 PHP worker from `php/worker.php` + `php/app.php` and speak the length-prefixed
 framing protocol. They are the strongest check that the Rust and PHP sides
-agree on the wire format — keep them green.
+agree on the wire format; keep them green.
 
 ## Architectural constraints
 
@@ -70,7 +70,7 @@ discussion in a PR.
    `worker.php` autoloads only the `Fium\` namespace. Composer packages are
    **not** embedded and would be invisible to a deployed worker. Every framework
    feature must be pure PHP. PHPUnit is a *dev* dependency and never ships in
-   the runtime — that is intentional and fine.
+   the runtime; that is intentional and fine.
 
 2. **Protocol changes are versioned.** The Rust↔PHP wire format is length-
    prefixed JSON frames (see `docs/protocol-v1.md` and the contract tests in

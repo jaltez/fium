@@ -140,10 +140,10 @@ For server-rendered HTML forms, use `Request::csrfField()` to inject the hidden 
 
 Handles CORS preflight (`OPTIONS`) and sets `Access-Control-*` headers. Configured via environment variables:
 
-- `FIUM_CORS_ORIGINS` — allowed origins (default: `*`)
-- `FIUM_CORS_METHODS` — allowed methods
-- `FIUM_CORS_HEADERS` — allowed headers
-- `FIUM_CORS_MAX_AGE` — preflight cache duration
+- `FIUM_CORS_ORIGINS`: allowed origins (default: `*`)
+- `FIUM_CORS_METHODS`: allowed methods
+- `FIUM_CORS_HEADERS`: allowed headers
+- `FIUM_CORS_MAX_AGE`: preflight cache duration
 
 ```php
 'middleware' => ['cors']

@@ -79,7 +79,7 @@ return [
 
 ## Response
 
-`Fium\Runtime\Response` — all factories are static and chainable via
+`Fium\Runtime\Response`: all factories are static and chainable via
 `withHeader()` / `withCookie()`.
 
 | Factory | Description |
@@ -227,7 +227,7 @@ Connection::transaction(fn () => /* atomic work */);
 `offset`, `get`, `first`, `count`, `exists`, `insert`, `update`, `delete`.
 
 > **Security:** values are always bound as parameters. Identifiers are validated
-> against `[a-zA-Z_][a-zA-Z0-9_]*` and used verbatim — never build identifiers
+> against `[a-zA-Z_][a-zA-Z0-9_]*` and used verbatim; never build identifiers
 > from untrusted input.
 
 `Fium\Database\Model` is an active-record base:

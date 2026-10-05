@@ -21,8 +21,8 @@ This is not intended as the final performance format. It is intended as the easi
 
 A PHP worker goes through two phases:
 
-1. **Boot** — the worker starts, loads the application file, and emits a single boot message on stdout containing the route manifest.
-2. **Request loop** — the worker reads request frames from stdin and writes response frames to stdout, one per request.
+1. **Boot**: the worker starts, loads the application file, and emits a single boot message on stdout containing the route manifest.
+2. **Request loop**: the worker reads request frames from stdin and writes response frames to stdout, one per request.
 
 When a worker crashes and the Rust supervisor restarts it, the new worker process repeats both phases. The runtime consumes and discards the boot message from restarted workers (the route table is already built from the initial boot).
 
@@ -32,18 +32,18 @@ The very first line a PHP worker writes to stdout after starting is a boot messa
 
 ### Boot Message Fields
 
-- `protocol_version` — integer, must match the runtime's expected version
-- `type` — string, must be `"boot"`
-- `routes` — array of route objects
+- `protocol_version`: integer, must match the runtime's expected version
+- `type`: string, must be `"boot"`
+- `routes`: array of route objects
 
 ### Boot Route Fields
 
 Each route object in the `routes` array contains:
 
-- `method` — HTTP method (e.g. `"GET"`, `"POST"`)
-- `path` — normalized path pattern (e.g. `"/hello/{name}"`)
-- `name` — route name for internal dispatch (e.g. `"get_hello_name"`)
-- `middleware` — array of middleware alias strings
+- `method`: HTTP method (e.g. `"GET"`, `"POST"`)
+- `path`: normalized path pattern (e.g. `"/hello/{name}"`)
+- `name`: route name for internal dispatch (e.g. `"get_hello_name"`)
+- `middleware`: array of middleware alias strings
 
 ### Example Boot Message
 
@@ -119,7 +119,7 @@ Every response sent from PHP to Rust contains:
 
 The runtime discovers routes dynamically at startup through the boot protocol. PHP declares routes in a single application file (e.g. `app.php`) using either:
 
-**Concise format** — string keys like `'METHOD /path'`:
+**Concise format**: string keys like `'METHOD /path'`:
 
 ```php
 return [

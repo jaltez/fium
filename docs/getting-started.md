@@ -2,8 +2,8 @@
 
 ## Prerequisites
 
-- **Rust** toolchain (1.75+) — [rustup.rs](https://rustup.rs)
-- **PHP** 8.1+ CLI — `php -v` to verify
+- **Rust** toolchain (1.75+): [rustup.rs](https://rustup.rs)
+- **PHP** 8.1+ CLI: `php -v` to verify
 
 ## Installation
 
@@ -121,6 +121,6 @@ return [
 
 ## Next steps
 
-- [Configuration Reference](configuration.md) — customize with `fium.toml`
-- [Middleware Guide](middleware.md) — all built-in middleware
-- [Deployment Guide](deployment.md) — production deployment
+- [Configuration Reference](configuration.md): customize with `fium.toml`
+- [Middleware Guide](middleware.md): all built-in middleware
+- [Deployment Guide](deployment.md): production deployment
