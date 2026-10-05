@@ -1,7 +1,14 @@
 # Contributing to Fium
 
-Thanks for helping improve Fium. This guide covers the build, the test suites,
-the architectural constraints that govern changes, and the pull-request process.
+> [!WARNING]
+> **This repository is archived (sunset).** Contributions, issues, and pull requests
+> are **closed** — the project is no longer maintained. This guide is kept only as a
+> record of the engineering practices and architectural constraints the project
+> followed, in case the code is useful to anyone studying it.
+
+Thanks for your interest in Fium. This guide documents the build, the test suites,
+the architectural constraints that governed changes, and the pull-request process
+used while the project was active.
 
 ## Prerequisites
 
